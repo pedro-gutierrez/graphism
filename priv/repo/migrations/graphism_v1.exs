@@ -3,21 +3,21 @@ defmodule Graphism.Migration.V1 do
 
   def up do
     create table("weather") do
-      add :city,    :string, size: 40
+      add :city, :string, size: 40
       add :temp_lo, :integer
       add :temp_hi, :integer
-      add :prcp,    :float
+      add :prcp, :float
 
-      timestamps()
+      # timestamps()
     end
 
     create table("plop") do
-      add :city,    :string, size: 40
+      add :city, :string, size: 40
       add :temp_lo, :integer
       add :temp_hi, :integer
-      add :prcp,    :float
+      add :prcp, :float
 
-      timestamps()
+      # timestamps()
     end
   end
 

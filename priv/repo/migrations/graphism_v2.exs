@@ -1,4 +1,4 @@
-defmodule Graphism.Migration.V1 do
+defmodule Graphism.Migration.V2 do
   use Ecto.Migration
 
   def up do
