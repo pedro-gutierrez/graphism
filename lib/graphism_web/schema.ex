@@ -9,14 +9,13 @@ defmodule GraphismWeb.Schema do
     attribute(:lang, :string)
     attribute(:verified, :boolean)
 
-    relation(:roles, :has_many, :role)
-    # has_many(:roles, :role)
+    has_many(:roles)
   end
 
   entity :role do
     attribute(:id, :id)
     attribute(:name, :string, unique: true)
-    relation(:permissions, :has_many, :permissions)
+    has_many(:permissions)
   end
 
   entity :permission do
