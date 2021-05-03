@@ -1,7 +1,7 @@
 defmodule GraphismWeb.Schema do
   use Graphism
 
-  entity :superUser do
+  entity :super_user do
     attribute(:id, :id)
     attribute(:email, :string, unique: true)
     attribute(:first, :string)
@@ -9,7 +9,13 @@ defmodule GraphismWeb.Schema do
     attribute(:lang, :string)
     attribute(:verified, :boolean)
 
-    has_many(:roles)
+    has_many(:super_user_roles, as: :roles)
+  end
+
+  entity :super_user_role do
+    attribute(:id, :id)
+    belongs_to(:super_user)
+    has_one(:role)
   end
 
   entity :role do

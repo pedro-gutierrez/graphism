@@ -56,7 +56,18 @@ defmodule Graphism do
         end
       end
 
-    [schema_fun, api_modules, objects, queries]
+    mutations =
+      quote do
+        mutation do
+          unquote do
+            Enum.flat_map(schema, fn e ->
+              graphql_mutations(e, schema)
+            end)
+          end
+        end
+      end
+
+    [schema_fun, api_modules, objects, queries, mutations]
   end
 
   defmacro entity(name, _attrs \\ [], do: block) do
@@ -79,7 +90,10 @@ defmodule Graphism do
   defmacro has_many(_name, _opts \\ []) do
   end
 
-  defmacro relation(_name, _cardinality, _target, _attrs \\ []) do
+  defmacro has_one(_name, _opts \\ []) do
+  end
+
+  defmacro belongs_to(_name, _opts \\ []) do
   end
 
   defp with_plural(entity) do
@@ -116,22 +130,42 @@ defmodule Graphism do
       end)
 
     # Index entities by name
-    # index =
-    #  Enum.reduce(schema, %{}, fn e, index ->
-    #    Map.put(index, e[:name], e)
-    #  end)
+    index =
+      Enum.reduce(schema, %{}, fn e, index ->
+        Map.put(index, e[:name], e)
+      end)
 
     schema
     |> Enum.map(fn e ->
-      resolve_relations!(e, plurals)
+      e
+      |> with_display_name()
+      |> with_relations!(index, plurals)
     end)
     |> IO.inspect()
+  end
+
+  def with_display_name(e) do
+    display_name =
+      e[:name]
+      |> Atom.to_string()
+      |> Recase.to_camel()
+      |> :string.titlecase()
+
+    plural_display_name =
+      e[:plural]
+      |> Atom.to_string()
+      |> Recase.to_camel()
+      |> :string.titlecase()
+
+    e
+    |> Keyword.put(:display_name, display_name)
+    |> Keyword.put(:plural_display_name, plural_display_name)
   end
 
   # Ensure all relations are properly formed. 
   # This function will raise an error if the target entity
   # for a relation cannot be found
-  defp resolve_relations!(e, plurals) do
+  defp with_relations!(e, index, plurals) do
     relations =
       e[:relations]
       |> Enum.map(fn rel ->
@@ -145,7 +179,22 @@ defmodule Graphism do
                     }"
             end
 
-            Keyword.put(rel, :target, target)
+            rel
+            |> Keyword.put(:target, target)
+            |> Keyword.put(:name, rel[:opts][:as] || rel[:name])
+
+          _ ->
+            target = index[rel[:name]]
+
+            unless target do
+              raise "Entity #{e[:name]} has relation #{rel[:name]} of unknown type: #{
+                      inspect(Map.keys(index))
+                    }"
+            end
+
+            rel
+            |> Keyword.put(:target, target[:name])
+            |> Keyword.put(:name, rel[:opts][:as] || rel[:name])
         end
       end)
 
@@ -195,6 +244,11 @@ defmodule Graphism do
                             quote do
                               list_of(unquote(rel[:target]))
                             end
+
+                          _ ->
+                            quote do
+                              non_null(unquote(rel[:target]))
+                            end
                         end
                       )
               end
@@ -208,13 +262,14 @@ defmodule Graphism do
     List.flatten([
       graphql_query_list_all(e, schema),
       graphql_query_find_by_id(e, schema),
-      graphql_query_find_by_unique_fields(e, schema)
+      graphql_query_find_by_unique_fields(e, schema),
+      graphql_query_find_by_parent_types(e, schema)
     ])
   end
 
   defp graphql_query_list_all(e, _schema) do
     quote do
-      @desc "List all " <> unquote("#{e[:plural]}")
+      @desc "List all " <> unquote("#{e[:plural_display_name]}")
       field unquote(e[:plural]), list_of(unquote(e[:name])) do
         resolve(fn _, _, _ ->
           {:ok, []}
@@ -225,8 +280,8 @@ defmodule Graphism do
 
   defp graphql_query_find_by_id(e, _schema) do
     quote do
-      @desc "Find a single " <> unquote("#{e[:name]}") <> " given its unique id"
-      field unquote(String.to_atom("get_#{e[:name]}_by_id")),
+      @desc "Find a single " <> unquote("#{e[:display_name]}") <> " given its unique id"
+      field unquote(String.to_atom("#{e[:name]}_by_id")),
             unquote(e[:name]) do
         resolve(fn _, _, _ ->
           {:ok, []}
@@ -241,8 +296,9 @@ defmodule Graphism do
     |> Enum.map(fn attr ->
       quote do
         @desc "Find a single " <>
-                unquote("#{e[:name]}") <> " given its unique " <> unquote("#{attr[:name]}")
-        field unquote(String.to_atom("get_#{e[:name]}_by_#{attr[:name]}")),
+                unquote("#{e[:display_name]}") <>
+                " given its unique " <> unquote("#{attr[:name]}")
+        field unquote(String.to_atom("#{e[:name]}_by_#{attr[:name]}")),
               unquote(e[:name]) do
           resolve(fn _, _, _ ->
             {:ok, []}
@@ -250,6 +306,58 @@ defmodule Graphism do
         end
       end
     end)
+  end
+
+  defp graphql_query_find_by_parent_types(e, _schema) do
+    e[:relations]
+    |> Enum.filter(fn rel -> :belongs_to == rel[:kind] end)
+    |> Enum.map(fn rel ->
+      quote do
+        @desc "Find all " <>
+                unquote("#{e[:plural_display_name]}") <>
+                " given their parent " <> unquote("#{rel[:target]}")
+        field unquote(String.to_atom("#{e[:plural]}_by_#{rel[:name]}")),
+              list_of(unquote(e[:name])) do
+          resolve(fn _, _, _ ->
+            {:ok, []}
+          end)
+        end
+      end
+    end)
+  end
+
+  defp graphql_mutations(e, schema) do
+    List.flatten([
+      graphql_create_mutation(e, schema)
+    ])
+  end
+
+  defp graphql_create_mutation(e, _schema) do
+    mutation_name = String.to_atom("create_#{e[:name]}")
+
+    quote do
+      @desc "Create a new " <> unquote("#{e[:display_name]}")
+      field unquote(mutation_name), non_null(unquote(e[:name])) do
+        unquote(
+          Enum.map(e[:attributes], fn attr ->
+            quote do
+              arg(unquote(attr[:name]), non_null(unquote(attr[:type])))
+            end
+          end) ++
+            (e[:relations]
+             |> Enum.filter(fn rel -> :belongs_to == rel[:kind] || :has_one == rel[:kind] end)
+             |> Enum.map(fn rel ->
+               quote do
+                 arg(unquote(rel[:name]), non_null(:id))
+               end
+             end))
+        )
+
+        resolve(fn _, _, _ ->
+          {:ok, %{}}
+        end)
+      end
+    end
   end
 
   defp attributes_from({:__block__, [], attrs}) do
@@ -277,6 +385,18 @@ defmodule Graphism do
 
       {:has_many, _, [name, opts]} ->
         [name: name, kind: :has_many, opts: opts]
+
+      {:has_one, _, [name]} ->
+        [name: name, kind: :has_one, opts: []]
+
+      {:has_one, _, [name, opts]} ->
+        [name: name, kind: :has_one, opts: opts]
+
+      {:belongs_to, _, [name]} ->
+        [name: name, kind: :belongs_to, opts: []]
+
+      {:belongs_to, _, [name, opts]} ->
+        [name: name, kind: :belongs_to, opts: opts]
 
       _ ->
         nil
