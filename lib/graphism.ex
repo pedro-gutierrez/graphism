@@ -7,6 +7,8 @@ defmodule Graphism do
   if it comes from the database, an external API or others.
   """
 
+  require Logger
+
   defmacro __using__(_opts \\ []) do
     Module.register_attribute(__CALLER__.module, :schema,
       accumulate: true,
@@ -33,11 +35,13 @@ defmodule Graphism do
 
     schema_migration = migration_from_schema(schema)
 
-    generate_missing_migrations(
-      existing_migrations,
-      schema_migration,
-      last_migration_version
-    )
+    missing_migrations =
+      missing_migrations(
+        existing_migrations,
+        schema_migration
+      )
+
+    write_migration(missing_migrations, last_migration_version + 1, dir: File.cwd!())
 
     api_modules =
       Enum.map(schema, fn e ->
@@ -239,7 +243,8 @@ defmodule Graphism do
     })
   end
 
-  defp generate_missing_migrations(existing, schema, last_version) do
+  defp missing_migrations(existing, schema) do
+    # New tables to be created
     tables_to_create = Map.keys(schema) -- Map.keys(existing)
 
     missing_migrations =
@@ -247,6 +252,7 @@ defmodule Graphism do
         [create_table_migration(name, schema) | acc]
       end)
 
+    # Old tables to be dropped
     tables_to_drop = Map.keys(existing) -- Map.keys(schema)
 
     missing_migrations =
@@ -254,14 +260,37 @@ defmodule Graphism do
         [drop_table_migration(name) | acc]
       end)
 
-    missing_migrations = Enum.reverse(missing_migrations)
+    # Add the tables to be merged. We need to 
+    # implement the same logic at the column level, for each table
+    tables_to_merge = Map.keys(schema) -- Map.keys(schema) -- Map.keys(existing)
 
-    IO.inspect(
-      existing: existing,
-      schema: schema,
-      last_version: last_version,
-      missing: missing_migrations
-    )
+    Enum.reduce(tables_to_merge, missing_migrations, fn name, acc ->
+      existing_columns = Map.keys(existing[name][:columns])
+      schema_columns = Map.keys(schema[name][:columns])
+
+      # columns to add
+      columns_to_add =
+        (schema_columns -- existing_columns)
+        |> Enum.map(fn col ->
+          column = schema[name][:columns][col]
+          [column: col, type: column[:type], opts: column[:opts], action: :add]
+        end)
+
+      # columns to remove
+      columns_to_remove = existing_columns -- schema_columns
+
+      case length(columns_to_add) + length(columns_to_remove) do
+        0 ->
+          # If we dont have anything to do, then we skip the 
+          # alter table migration altogether
+          []
+
+        _ ->
+          [alter_table_migration(name, columns_to_add, columns_to_remove) | acc]
+      end
+    end)
+    |> Enum.reverse()
+    |> IO.inspect()
   end
 
   defp create_table_migration(name, schema) do
@@ -279,6 +308,20 @@ defmodule Graphism do
     [
       table: name,
       action: :drop
+    ]
+  end
+
+  defp alter_table_migration(name, columns_to_add, columns_to_remove) do
+    [
+      table: name,
+      action: :alter,
+      columns:
+        Enum.map(columns_to_add, fn col ->
+          [column: col[:column], type: col[:type], opts: col[:opts], action: :add]
+        end) ++
+          Enum.map(columns_to_remove, fn col ->
+            [column: col, action: :remove]
+          end)
     ]
   end
 
@@ -304,11 +347,11 @@ defmodule Graphism do
     |> Enum.reduce(%{}, &reduce_migration(&1, &2))
   end
 
-  defp reduce_migration([table: t, action: :drop, columns: _], acc) do
+  defp reduce_migration([table: t, action: :drop, opts: _, columns: _], acc) do
     Map.drop(acc, [t])
   end
 
-  defp reduce_migration([table: t, action: :create, columns: cols], acc) do
+  defp reduce_migration([table: t, action: :create, opts: _, columns: cols], acc) do
     # Since this is a create table migration,
     # all columns must be present. We just need to remove the 
     # action on each column
@@ -322,7 +365,10 @@ defmodule Graphism do
     Map.put(acc, t, %{columns: cols})
   end
 
-  defp reduce_migration([table: t, action: :alter, columns: column_changes] = spec, acc) do
+  defp reduce_migration(
+         [table: t, action: :alter, opts: _, columns: column_changes] = spec,
+         acc
+       ) do
     table = Map.get(acc, t)
 
     # Ensure the table is already present in our current
@@ -360,6 +406,8 @@ defmodule Graphism do
     |> Enum.take(-1)
     |> migration_version()
   end
+
+  defp migration_version([]), do: 0
 
   defp migration_version([
          {:defmodule, _,
@@ -407,6 +455,7 @@ defmodule Graphism do
           ]}
        ) do
     Enum.map(up, &parse_up(&1))
+    |> Enum.reject(fn item -> item == [] end)
   end
 
   defp parse_migration(
@@ -435,6 +484,12 @@ defmodule Graphism do
           ]}
        ) do
     [parse_up(up)]
+    |> Enum.reject(fn item -> item == [] end)
+  end
+
+  defp parse_migration({:defmodule, _, [{:__aliases__, _, migration}, _]}) do
+    Logger.warn("Unable to parse migration #{Enum.join(migration, ".")}")
+    []
   end
 
   defp parse_up(
@@ -446,12 +501,7 @@ defmodule Graphism do
             ]
           ]}
        ) do
-    columns =
-      changes
-      |> Enum.map(&column_change(&1))
-      |> Enum.reduce(%{}, &into_columns_map(&1, &2))
-
-    [table: String.to_atom(table), action: action, columns: columns]
+    table_change(table, action, [], changes)
   end
 
   defp parse_up(
@@ -463,20 +513,58 @@ defmodule Graphism do
             ]
           ]}
        ) do
-    columns =
-      change
-      |> column_change()
-      |> into_columns_map(%{})
-
-    [table: String.to_atom(table), action: action, columns: columns]
+    table_change(table, action, [], [change])
   end
 
-  defp into_columns_map(col, map) do
-    Map.put(map, col[:column], %{
-      type: col[:type],
-      opts: col[:opts],
-      action: col[:action]
-    })
+  defp parse_up(
+         {action, _,
+          [
+            {:table, _, [table, opts]},
+            [
+              do: {:__block__, [], changes}
+            ]
+          ]}
+       ) do
+    table_change(table, action, opts, changes)
+  end
+
+  defp parse_up(
+         {action, _,
+          [
+            {:table, _, [table]}
+          ]}
+       ) do
+    table_change(table, action, [], [])
+  end
+
+  defp parse_up(other) do
+    Logger.warn(
+      "Unable to parse migration code #{inspect(other)}: #{
+        other |> Macro.to_string() |> Code.format_string!()
+      }"
+    )
+
+    []
+  end
+
+  defp table_name(n) when is_binary(n), do: String.to_atom(n)
+  defp table_name(n) when is_atom(n), do: n
+
+  defp table_change(table, action, opts, columns) do
+    columns =
+      columns
+      |> Enum.map(&column_change(&1))
+      |> Enum.reduce(%{}, fn col, map ->
+        Map.put(map, col[:column], %{
+          type: col[:type],
+          opts: col[:opts],
+          action: col[:action]
+        })
+      end)
+
+    table = table_name(table)
+
+    [table: table, action: action, opts: opts, columns: columns]
   end
 
   defp column_change({:timestamps, _, _}) do
@@ -484,14 +572,100 @@ defmodule Graphism do
   end
 
   defp column_change({action, _, [name, type]}) do
-    [column: name, type: type, ops: [], action: action]
+    [column: name, type: type, opts: [], action: action]
   end
 
-  defp column_change({action, _, [name, type, ops]}) do
-    [column: name, type: type, ops: ops, action: action]
+  defp column_change({action, _, [name, type, opts]}) do
+    [column: name, type: type, opts: opts, action: action]
   end
 
   defp column_change({action, _, [name]}) do
     [column: name, action: action]
+  end
+
+  defp write_migration([], _, _) do
+    IO.puts("No migrations to write")
+  end
+
+  defp write_migration(migration, version, opts) do
+    module_name = [:Graphism, :Migration, String.to_atom("V#{version}")]
+    up = Enum.map(migration, &quote_migration(&1))
+
+    code =
+      module_name
+      |> migration_module(up)
+      |> Macro.to_string()
+      |> Code.format_string!()
+      |> IO.inspect()
+
+    path = Path.join([opts[:dir], "priv", "repo", "migrations", "graphism_v#{version}.exs"])
+    File.write!(path, code)
+    IO.puts("Written #{path}")
+  end
+
+  defp migration_module(name, up) do
+    {:defmodule, [line: 1],
+     [
+       {:__aliases__, [line: 1], name},
+       [
+         do:
+           {:__block__, [],
+            [
+              {:use, [line: 1], [{:__aliases__, [line: 1], [:Ecto, :Migration]}]},
+              {:def, [line: 1],
+               [
+                 {:up, [line: 1], nil},
+                 [
+                   do: {:__block__, [], up}
+                 ]
+               ]},
+              {:def, [line: 1],
+               [
+                 {:down, [line: 1], nil},
+                 [do: []]
+               ]}
+            ]}
+       ]
+     ]}
+  end
+
+  defp quote_migration(table: table, action: :create, columns: cols) do
+    {:create, [line: 1],
+     [
+       {:table, [line: 1], [table, [primary_key: false]]},
+       [
+         do: {:__block__, [], Enum.map(cols, &column_change_ast(&1))}
+       ]
+     ]}
+  end
+
+  defp quote_migration(table: table, action: :alter, columns: cols) do
+    {:alter, [line: 1],
+     [
+       {:table, [line: 1], [table]},
+       [
+         do: {:__block__, [], Enum.map(cols, &column_change_ast(&1))}
+       ]
+     ]}
+  end
+
+  defp quote_migration(table: table, action: :drop) do
+    {:drop, [line: 1],
+     [
+       {:table, [line: 1], [table]}
+     ]}
+  end
+
+  # Given a column change, generate the AST that will be
+  # included in a migration, inside a create/alter table block
+  defp column_change_ast(column: name, type: type, opts: _, action: :add) do
+    {:add, [], [name, type]}
+  end
+
+  # Translates a drop table change into the AST
+  # that will be included in a migration, inside an alter
+  # table block
+  defp column_change_ast(column: name, action: :remove) do
+    {:remove, [], [name]}
   end
 end
