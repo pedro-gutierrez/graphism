@@ -327,9 +327,11 @@ defmodule Graphism do
   end
 
   defp graphql_mutations(e, schema) do
-    List.flatten([
-      graphql_create_mutation(e, schema)
-    ])
+    [
+      graphql_create_mutation(e, schema),
+      graphql_update_mutation(e, schema),
+      graphql_delete_mutation(e, schema)
+    ]
   end
 
   defp graphql_create_mutation(e, _schema) do
@@ -352,6 +354,49 @@ defmodule Graphism do
                end
              end))
         )
+
+        resolve(fn _, _, _ ->
+          {:ok, %{}}
+        end)
+      end
+    end
+  end
+
+  defp graphql_update_mutation(e, _schema) do
+    mutation_name = String.to_atom("update_#{e[:name]}")
+
+    quote do
+      @desc "Update an existing " <> unquote("#{e[:display_name]}")
+      field unquote(mutation_name), non_null(unquote(e[:name])) do
+        unquote(
+          Enum.map(e[:attributes], fn attr ->
+            quote do
+              arg(unquote(attr[:name]), non_null(unquote(attr[:type])))
+            end
+          end) ++
+            (e[:relations]
+             |> Enum.filter(fn rel -> :belongs_to == rel[:kind] || :has_one == rel[:kind] end)
+             |> Enum.map(fn rel ->
+               quote do
+                 arg(unquote(rel[:name]), non_null(:id))
+               end
+             end))
+        )
+
+        resolve(fn _, _, _ ->
+          {:ok, %{}}
+        end)
+      end
+    end
+  end
+
+  defp graphql_delete_mutation(e, _schema) do
+    mutation_name = String.to_atom("delete_#{e[:name]}")
+
+    quote do
+      @desc "Delete an existing " <> unquote("#{e[:display_name]}")
+      field unquote(mutation_name), unquote(e[:name]) do
+        arg(:id, non_null(:id))
 
         resolve(fn _, _, _ ->
           {:ok, %{}}
