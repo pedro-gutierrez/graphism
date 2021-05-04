@@ -59,10 +59,11 @@ defmodule Graphism.Migrations do
     # to be added to the table migrations
     m =
       Enum.reduce(e[:attributes], %{}, fn attr, m ->
+        name = column_name_from_attribute(attr)
         type = column_type_from_attribute(attr)
         opts = column_opts_from_attribute(attr)
 
-        Map.put(m, attr[:name], %{
+        Map.put(m, name, %{
           type: type,
           opts: opts
         })
@@ -83,8 +84,17 @@ defmodule Graphism.Migrations do
         })
       end)
 
+    # Inspect attributes and derive unique indices
+    indices =
+      e[:attributes]
+      |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+      |> Enum.reduce([], fn attr, acc ->
+        [index_from_attribute(attr, e) | acc]
+      end)
+
     Map.put(acc, e[:table], %{
-      columns: m
+      columns: m,
+      indices: indices
     })
   end
 
@@ -152,13 +162,23 @@ defmodule Graphism.Migrations do
     end
   end
 
+  defp column_name_from_attribute(attr) do
+    attr[:name]
+  end
+
+  defp index_from_attribute(attr, e) do
+    column_name = column_name_from_attribute(attr)
+    index_name = String.to_atom("unique_#{column_name}_per_#{e[:table]}")
+    [table: e[:table], name: index_name, columns: [column_name]]
+  end
+
   defp missing_migrations(existing, schema) do
     # New tables to be created
     tables_to_create = Map.keys(schema) -- Map.keys(existing)
 
     missing_migrations =
       Enum.reduce(tables_to_create, [], fn name, acc ->
-        [create_table_migration(name, schema) | acc]
+        [create_table_migration(name, schema)] ++ create_indices_migrations(name, schema) ++ acc
       end)
 
     # Old tables to be dropped
@@ -192,7 +212,7 @@ defmodule Graphism.Migrations do
         0 ->
           # If we dont have anything to do, then we skip the
           # alter table migration altogether
-          []
+          acc
 
         _ ->
           [alter_table_migration(name, columns_to_add, columns_to_remove) | acc]
@@ -209,6 +229,26 @@ defmodule Graphism.Migrations do
         Enum.map(schema[name][:columns], fn {col, spec} ->
           migration_from_column(col, spec, :add)
         end)
+    ]
+  end
+
+  # Add migrations for new indices to be created for the given table
+  defp create_indices_migrations(name, schema) do
+    case schema[name][:indices] do
+      [] ->
+        []
+
+      indices ->
+        Enum.map(indices, &create_index_migration(&1))
+    end
+  end
+
+  defp create_index_migration(index) do
+    [
+      index: index[:name],
+      action: :create,
+      table: index[:table],
+      columns: index[:columns]
     ]
   end
 
@@ -270,7 +310,27 @@ defmodule Graphism.Migrations do
 
     # Then replace the resulting table columns
     # in our accumulator
-    Map.put(acc, t, %{columns: cols})
+    Map.put(acc, t, %{indices: %{}, columns: cols})
+  end
+
+  defp reduce_migration([index: name, action: :create, table: table, columns: columns], acc) do
+    t = Map.get(acc, table)
+
+    unless t do
+      raise "Index #{name} references unknown table #{table}: #{inspect(Map.keys(table))}"
+    end
+
+    %{indices: indices} = t
+
+    indices =
+      Map.put(indices, name, %{
+        name: name,
+        table: table,
+        columns: columns
+      })
+
+    t = Map.put(t, :indices, indices)
+    Map.put(acc, table, t)
   end
 
   defp reduce_migration(
@@ -457,6 +517,15 @@ defmodule Graphism.Migrations do
     table_change(table, action, [], [])
   end
 
+  defp parse_up(
+         {action, _,
+          [
+            {:unique_index, _, [table, columns, opts]}
+          ]}
+       ) do
+    index_change(table, action, columns, opts)
+  end
+
   defp parse_up(other) do
     Logger.warn(
       "Unable to parse migration code #{inspect(other)}: #{
@@ -503,6 +572,10 @@ defmodule Graphism.Migrations do
     [column: name, action: action]
   end
 
+  defp index_change(table, action, columns, opts) do
+    [index: opts[:name], action: action, table: table, columns: columns]
+  end
+
   defp write_migration([], _, _) do
     IO.puts("No migrations to write")
   end
@@ -542,16 +615,26 @@ defmodule Graphism.Migrations do
   # so that we apply top level migration first (ie a table that does not
   # depend on other tables) and dependent tables after
   defp sort_migration(m1, m2) do
-    depends(m2, m1)
+    not depends(m1, m2)
   end
 
   # Figure out whether child migration depends on parent
   defp depends(child, parent) do
-    not (child[:columns]
-         |> Enum.filter(fn col ->
-           col[:opts][:references] == parent[:table]
-         end)
-         |> Enum.empty?())
+    case child[:index] do
+      nil ->
+        # we are dealing with a table
+        # See if there is a foreign reference to the parent
+        not (child[:columns]
+             |> Enum.filter(fn col ->
+               IO.inspect(col)
+               col[:opts][:references] == parent[:table]
+             end)
+             |> Enum.empty?())
+
+      _ ->
+        # We are dealing with an index
+        child[:table] == parent[:table]
+    end
   end
 
   defp migration_module(name, up) do
@@ -604,6 +687,13 @@ defmodule Graphism.Migrations do
     {:drop, [line: 1],
      [
        {:table, [line: 1], [table]}
+     ]}
+  end
+
+  defp quote_migration(index: index, action: :create, table: table, columns: columns) do
+    {:create, [line: 1],
+     [
+       {:unique_index, [line: 1], [table, columns, [name: index]]}
      ]}
   end
 
