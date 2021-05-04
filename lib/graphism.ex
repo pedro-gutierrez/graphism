@@ -141,7 +141,6 @@ defmodule Graphism do
       |> with_display_name()
       |> with_relations!(index, plurals)
     end)
-    |> IO.inspect()
   end
 
   def with_display_name(e) do
@@ -213,7 +212,7 @@ defmodule Graphism do
             |> Enum.reject(fn attr -> attr[:name] == :id end)
             |> Enum.map(fn attr ->
               quote do
-                Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:type]))
+                Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:kind]))
               end
             end)
           end
@@ -231,7 +230,7 @@ defmodule Graphism do
           # Add a field for each attribute
           Enum.map(e[:attributes], fn attr ->
             quote do
-              field unquote(attr[:name]), unquote(attr[:type])
+              field unquote(attr[:name]), unquote(attr[:kind])
             end
           end) ++
             Enum.map(e[:relations], fn rel ->
@@ -343,7 +342,7 @@ defmodule Graphism do
         unquote(
           Enum.map(e[:attributes], fn attr ->
             quote do
-              arg(unquote(attr[:name]), non_null(unquote(attr[:type])))
+              arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
             end
           end) ++
             (e[:relations]
@@ -371,7 +370,7 @@ defmodule Graphism do
         unquote(
           Enum.map(e[:attributes], fn attr ->
             quote do
-              arg(unquote(attr[:name]), non_null(unquote(attr[:type])))
+              arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
             end
           end) ++
             (e[:relations]
@@ -417,12 +416,10 @@ defmodule Graphism do
     |> Enum.reject(fn attr -> attr == nil end)
   end
 
-  defp attribute([name, type]), do: [name: name, type: type, opts: []]
-  defp attribute([name, type, opts]), do: [name: name, type: type, opts: opts]
+  defp attribute([name, kind]), do: [name: name, kind: kind, opts: []]
+  defp attribute([name, kind, opts]), do: [name: name, kind: kind, opts: opts]
 
   defp relations_from({:__block__, [], attrs}) do
-    IO.inspect(attrs: attrs)
-
     attrs
     |> Enum.map(fn
       {:has_many, _, [name]} ->

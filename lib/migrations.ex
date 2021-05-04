@@ -6,10 +6,10 @@ defmodule Graphism.Migrations do
   require Logger
 
   @migrations_dir Path.join([File.cwd!(), "priv/repo/migrations"])
-  @migrations Path.join([@migrations_dir, "graphism_*.exs"])
+  @migrations Path.join([@migrations_dir, "*_graphism_*.exs"])
 
   @doc """
-  Generate migrations for the given schema. 
+  Generate migrations for the given schema.
 
   """
   def generate(module: mod) do
@@ -35,34 +35,121 @@ defmodule Graphism.Migrations do
   end
 
   defp migration_from_schema(schema) do
-    Enum.reduce(schema, %{}, fn entity, acc ->
-      migration_from_entity(entity, schema, acc)
+    # Index all entities, so that we can figure out foreign keys
+    # using plurals and table names from referenced entities
+    index =
+      Enum.reduce(schema, %{}, fn e, acc ->
+        table_name =
+          e[:plural]
+          |> Atom.to_string()
+          |> Recase.to_snake()
+          |> String.to_atom()
+
+        e = Keyword.put(e, :table, table_name)
+        Map.put(acc, e[:name], e)
+      end)
+
+    Enum.reduce(index, %{}, fn {_, entity}, acc ->
+      migration_from_entity(entity, index, acc)
     end)
   end
 
-  defp migration_from_entity(e, _, acc) do
-    # convert entity attributes as simple columns 
+  defp migration_from_entity(e, index, acc) do
+    # convert entity attributes as simple columns
     # to be added to the table migrations
     m =
       Enum.reduce(e[:attributes], %{}, fn attr, m ->
+        type = column_type_from_attribute(attr)
+        opts = column_opts_from_attribute(attr)
+
         Map.put(m, attr[:name], %{
-          type: attr[:type],
-          opts: attr[:opts]
+          type: type,
+          opts: opts
         })
       end)
 
-    # also convert entity relations as 
-    # foreign keys in the table migration
+    # convert entity relations as foreign keys
+    # to be added to the table migrations
+    m =
+      e[:relations]
+      |> Enum.filter(fn rel -> :has_one == rel[:kind] or :belongs_to == rel[:kind] end)
+      |> Enum.reduce(m, fn rel, m ->
+        name = column_name_from_relation(rel)
+        opts = column_opts_from_relation(rel, index)
 
-    table_name =
-      e[:plural]
-      |> Atom.to_string()
-      |> Recase.to_snake()
-      |> String.to_atom()
+        Map.put(m, name, %{
+          type: :uuid,
+          opts: opts
+        })
+      end)
 
-    Map.put(acc, table_name, %{
+    Map.put(acc, e[:table], %{
       columns: m
     })
+  end
+
+  # Resolve an entity by name. This function raises an error
+  # if no such entity was found
+  defp entity!(index, name) do
+    e = Map.get(index, name)
+
+    unless e do
+      raise "Could not resolve entity #{name}: #{inspect(Map.keys(index))}"
+    end
+
+    e
+  end
+
+  defp column_name_from_relation(rel) do
+    String.to_atom("#{rel[:name]}_id")
+  end
+
+  defp column_opts_from_relation(rel, index) do
+    target = entity!(index, rel[:target])
+    referenced_tabled = target[:table]
+    [null: false, references: referenced_tabled]
+  end
+
+  defp column_opts_from_attribute(attr) do
+    []
+    |> column_opts_with_primary_key(attr)
+    |> column_opts_with_null(attr)
+  end
+
+  defp column_opts_with_primary_key(opts, attr) do
+    case attr[:name] do
+      :id ->
+        Keyword.put(opts, :primary_key, true)
+
+      _ ->
+        opts
+    end
+  end
+
+  defp column_opts_with_null(opts, attr) do
+    case attr[:opts][:optional] do
+      nil ->
+        Keyword.put(opts, :null, false)
+
+      _ ->
+        opts
+    end
+  end
+
+  defp column_type_from_attribute(attr) do
+    kind = attr[:kind]
+
+    unless kind do
+      raise "entity attribute #{inspect(attr)} has no kind"
+    end
+
+    case kind do
+      :id ->
+        :uuid
+
+      _ ->
+        kind
+    end
   end
 
   defp missing_migrations(existing, schema) do
@@ -82,7 +169,7 @@ defmodule Graphism.Migrations do
         [drop_table_migration(name) | acc]
       end)
 
-    # Add the tables to be merged. We need to 
+    # Add the tables to be merged. We need to
     # implement the same logic at the column level, for each table
     tables_to_merge = Map.keys(schema) -- Map.keys(schema) -- Map.keys(existing)
 
@@ -103,7 +190,7 @@ defmodule Graphism.Migrations do
 
       case length(columns_to_add) + length(columns_to_remove) do
         0 ->
-          # If we dont have anything to do, then we skip the 
+          # If we dont have anything to do, then we skip the
           # alter table migration altogether
           []
 
@@ -174,7 +261,7 @@ defmodule Graphism.Migrations do
 
   defp reduce_migration([table: t, action: :create, opts: _, columns: cols], acc) do
     # Since this is a create table migration,
-    # all columns must be present. We just need to remove the 
+    # all columns must be present. We just need to remove the
     # action on each column
     cols =
       Enum.reduce(cols, %{}, fn {name, spec}, acc ->
@@ -200,7 +287,7 @@ defmodule Graphism.Migrations do
     end
 
     # Reduce the column changeset on top of the existing columns
-    # We either drop columns, add new ones, or renaming existing or 
+    # We either drop columns, add new ones, or renaming existing or
     # change their types
     new_columns =
       column_changes
@@ -217,7 +304,7 @@ defmodule Graphism.Migrations do
         end
       end)
 
-    # Then replace the resulting table columns 
+    # Then replace the resulting table columns
     # in our accumulator
     put_in(acc, [t, :columns], new_columns)
   end
@@ -352,6 +439,18 @@ defmodule Graphism.Migrations do
   defp parse_up(
          {action, _,
           [
+            {:table, _, [table, opts]},
+            [
+              do: change
+            ]
+          ]}
+       ) do
+    table_change(table, action, opts, [change])
+  end
+
+  defp parse_up(
+         {action, _,
+          [
             {:table, _, [table]}
           ]}
        ) do
@@ -410,7 +509,11 @@ defmodule Graphism.Migrations do
 
   defp write_migration(migration, version, opts) do
     module_name = [:Graphism, :Migration, String.to_atom("V#{version}")]
-    up = Enum.map(migration, &quote_migration(&1))
+
+    up =
+      migration
+      |> Enum.sort(&sort_migration(&1, &2))
+      |> Enum.map(&quote_migration(&1))
 
     code =
       module_name
@@ -418,9 +521,37 @@ defmodule Graphism.Migrations do
       |> Macro.to_string()
       |> Code.format_string!()
 
-    path = Path.join([opts[:dir], "priv", "repo", "migrations", "graphism_v#{version}.exs"])
+    {:ok, timestamp} =
+      Calendar.DateTime.now_utc()
+      |> Calendar.Strftime.strftime("%Y%m%d%H%M%S")
+
+    path =
+      Path.join([
+        opts[:dir],
+        "priv",
+        "repo",
+        "migrations",
+        "#{timestamp}_graphism_v#{version}.exs"
+      ])
+
     File.write!(path, code)
     IO.puts("Written #{path}")
+  end
+
+  # Sort migrations depending on whether one references another
+  # so that we apply top level migration first (ie a table that does not
+  # depend on other tables) and dependent tables after
+  defp sort_migration(m1, m2) do
+    depends(m2, m1)
+  end
+
+  # Figure out whether child migration depends on parent
+  defp depends(child, parent) do
+    not (child[:columns]
+         |> Enum.filter(fn col ->
+           col[:opts][:references] == parent[:table]
+         end)
+         |> Enum.empty?())
   end
 
   defp migration_module(name, up) do
@@ -478,8 +609,21 @@ defmodule Graphism.Migrations do
 
   # Given a column change, generate the AST that will be
   # included in a migration, inside a create/alter table block
-  defp column_change_ast(column: name, type: type, opts: _, action: :add) do
-    {:add, [], [name, type]}
+  defp column_change_ast(column: name, type: type, opts: opts, action: :add) do
+    case opts do
+      [] ->
+        {:add, [], [name, type]}
+
+      _ ->
+        # Transform :references hints into proper migration DSL
+        case opts[:references] do
+          nil ->
+            {:add, [], [name, type, opts]}
+
+          target_table ->
+            {:add, [], [name, {:references, [], [target_table, [type: :uuid]]}, [null: false]]}
+        end
+    end
   end
 
   # Translates a drop table change into the AST

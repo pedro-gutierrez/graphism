@@ -28,4 +28,9 @@ defmodule GraphismWeb.Schema do
     attribute(:id, :id)
     attribute(:name, :string, unique: true)
   end
+
+  entity :token do
+    attribute(:id, :id)
+    attribute(:expires, :string)
+  end
 end
