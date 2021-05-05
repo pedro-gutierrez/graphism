@@ -3,7 +3,7 @@ defmodule GraphismWeb.Schema do
 
   entity :super_user do
     attribute(:id, :id)
-    attribute(:email, :string, unique: true)
+    attribute(:email, :string)
     attribute(:first, :string)
     attribute(:last, :string)
     attribute(:lang, :string)
@@ -21,13 +21,13 @@ defmodule GraphismWeb.Schema do
   entity :role do
     attribute(:id, :id)
     attribute(:name, :string, unique: true)
-    has_many(:permissions)
+    ##  has_many(:permissions)
   end
 
-  entity :permission do
-    attribute(:id, :id)
-    attribute(:name, :string, unique: true)
-  end
+  ## entity :permission do
+  ##  attribute(:id, :id)
+  ##  attribute(:name, :string, unique: true)
+  ## end
 
   entity :token do
     attribute(:id, :id)

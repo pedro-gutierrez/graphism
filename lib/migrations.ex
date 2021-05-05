@@ -243,10 +243,39 @@ defmodule Graphism.Migrations do
     end
   end
 
+  # Look for existing indices for the given table name
+  # The lookup is performed on the schema built from the 
+  # existing migrations, which is reduced into 
+  # maps. 
+  # defp drop_indices_migrations(name, existing) do
+  #  case existing[name][:indices] do
+  #    [] ->
+  #      []
+
+  #    indices ->
+  #      Enum.map(indices, fn {_, index} ->
+  #        # convert the index into a keyword list
+  #        # for consistency with other use cases where we
+  #        # are building the index from the current schema
+  #        index
+  #        |> Keyword.new()
+  #        |> drop_index_migration()
+  #      end)
+  #  end
+  # end
+
   defp create_index_migration(index) do
+    index_migration(index, :create)
+  end
+
+  # defp drop_index_migration(index) do
+  #  index_migration(index, :drop)
+  # end
+
+  defp index_migration(index, action) do
     [
       index: index[:name],
-      action: :create,
+      action: action,
       table: index[:table],
       columns: index[:columns]
     ]
@@ -295,7 +324,7 @@ defmodule Graphism.Migrations do
     |> Enum.reduce(%{}, &reduce_migration(&1, &2))
   end
 
-  defp reduce_migration([table: t, action: :drop, opts: _, columns: _], acc) do
+  defp reduce_migration([table: t, action: :drop_if_exists, opts: _, columns: _], acc) do
     Map.drop(acc, [t])
   end
 
@@ -317,7 +346,7 @@ defmodule Graphism.Migrations do
     t = Map.get(acc, table)
 
     unless t do
-      raise "Index #{name} references unknown table #{table}: #{inspect(Map.keys(table))}"
+      raise "Index #{name} references unknown table #{table}: #{inspect(Map.keys(acc))}"
     end
 
     %{indices: indices} = t
@@ -329,6 +358,23 @@ defmodule Graphism.Migrations do
         columns: columns
       })
 
+    t = Map.put(t, :indices, indices)
+    Map.put(acc, table, t)
+  end
+
+  defp reduce_migration(
+         [index: name, action: :drop_if_exists, table: table, columns: _],
+         acc
+       ) do
+    t = Map.get(acc, table)
+
+    unless t do
+      raise "Index #{name} references unknown table #{table}: #{inspect(Map.keys(acc))}"
+    end
+
+    %{indices: indices} = t
+
+    indices = Map.drop(indices, [name])
     t = Map.put(t, :indices, indices)
     Map.put(acc, table, t)
   end
@@ -526,6 +572,15 @@ defmodule Graphism.Migrations do
     index_change(table, action, columns, opts)
   end
 
+  defp parse_up(
+         {action, _,
+          [
+            {:index, _, [table, columns, opts]}
+          ]}
+       ) do
+    index_change(table, action, columns, opts)
+  end
+
   defp parse_up(other) do
     Logger.warn(
       "Unable to parse migration code #{inspect(other)}: #{
@@ -626,7 +681,6 @@ defmodule Graphism.Migrations do
         # See if there is a foreign reference to the parent
         not (child[:columns]
              |> Enum.filter(fn col ->
-               IO.inspect(col)
                col[:opts][:references] == parent[:table]
              end)
              |> Enum.empty?())
@@ -684,7 +738,7 @@ defmodule Graphism.Migrations do
   end
 
   defp quote_migration(table: table, action: :drop) do
-    {:drop, [line: 1],
+    {:drop_if_exists, [line: 1],
      [
        {:table, [line: 1], [table]}
      ]}
@@ -694,6 +748,13 @@ defmodule Graphism.Migrations do
     {:create, [line: 1],
      [
        {:unique_index, [line: 1], [table, columns, [name: index]]}
+     ]}
+  end
+
+  defp quote_migration(index: index, action: :drop, table: table, columns: columns) do
+    {:drop_if_exists, [line: 1],
+     [
+       {:index, [line: 1], [table, columns, [name: index]]}
      ]}
   end
 
