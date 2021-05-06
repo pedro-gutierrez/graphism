@@ -20,7 +20,7 @@ defmodule GraphismWeb.Schema do
 
   entity :role do
     attribute(:id, :id)
-    attribute(:name, :string, unique: true)
+    attribute(:name, :string, one_of: [:admin, :user], default: :user, unique: true)
     ##  has_many(:permissions)
   end
 

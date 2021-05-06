@@ -40,6 +40,11 @@ defmodule Graphism do
         api_module(e, schema, caller: __CALLER__)
       end)
 
+    enums =
+      Enum.map(schema, fn e ->
+        graphql_enum(e, schema)
+      end)
+
     objects =
       Enum.map(schema, fn e ->
         graphql_object(e, schema)
@@ -67,7 +72,7 @@ defmodule Graphism do
         end
       end
 
-    [schema_fun, api_modules, objects, queries, mutations]
+    List.flatten([schema_fun, api_modules, enums, objects, queries, mutations])
   end
 
   defmacro entity(name, _attrs \\ [], do: block) do
@@ -75,9 +80,11 @@ defmodule Graphism do
     rels = relations_from(block)
 
     entity =
-      [name: name, attributes: attrs, relations: rels]
+      [name: name, attributes: attrs, relations: rels, enums: []]
       |> with_plural()
       |> with_schema_module()
+      |> with_enums()
+      |> IO.inspect()
 
     Module.put_attribute(__CALLER__.module, :schema, entity)
 
@@ -118,6 +125,25 @@ defmodule Graphism do
       :schema_module,
       module_name
     )
+  end
+
+  # Inspect attributes and extract enum types from those attributes
+  # that have a defined set of possible values
+  defp with_enums(entity) do
+    enums =
+      entity[:attributes]
+      |> Enum.filter(fn attr -> attr[:opts][:one_of] end)
+      |> Enum.reduce([], fn attr, enums ->
+        enum_name = enum_name(entity, attr)
+        values = attr[:opts][:one_of]
+        [[name: enum_name, values: values] | enums]
+      end)
+
+    Keyword.put(entity, :enums, enums)
+  end
+
+  defp enum_name(e, attr) do
+    String.to_atom("#{e[:name]}_#{attr[:name]}s")
   end
 
   # Resolves the given schema, by inspecting links between entities
@@ -229,8 +255,21 @@ defmodule Graphism do
         unquote do
           # Add a field for each attribute
           Enum.map(e[:attributes], fn attr ->
+            # determine the kind for this field, depending
+            # on whether it is an enum or not
+            kind =
+              case attr[:opts][:one_of] do
+                nil ->
+                  # it is not an enum, so we use its defined type
+                  attr[:kind]
+
+                [_ | _] ->
+                  # use the name of the enum as the type
+                  enum_name(e, attr)
+              end
+
             quote do
-              field unquote(attr[:name]), unquote(attr[:kind])
+              field unquote(attr[:name]), unquote(kind)
             end
           end) ++
             Enum.map(e[:relations], fn rel ->
@@ -255,6 +294,14 @@ defmodule Graphism do
         end
       end
     end
+  end
+
+  defp graphql_enum(e, _) do
+    Enum.map(e[:enums], fn enum ->
+      quote do
+        enum(unquote(enum[:name]), values: unquote(enum[:values]))
+      end
+    end)
   end
 
   defp graphql_queries(e, schema) do

@@ -2,16 +2,11 @@ defmodule(Graphism.Migration.V1) do
   use(Ecto.Migration)
 
   def(up) do
-    create(table(:permissions, primary_key: false)) do
-      add(:id, :uuid, null: false, primary_key: true)
-      add(:name, :string, null: false)
-    end
-
-    create(unique_index(:permissions, [:name], name: :unique_name_per_permissions))
+    execute("create type roles_name as ENUM ('admin','user')")
 
     create(table(:roles, primary_key: false)) do
       add(:id, :uuid, null: false, primary_key: true)
-      add(:name, :string, null: false)
+      add(:name, :roles_name, default: "user", null: false)
     end
 
     create(unique_index(:roles, [:name], name: :unique_name_per_roles))
@@ -24,8 +19,6 @@ defmodule(Graphism.Migration.V1) do
       add(:last, :string, null: false)
       add(:verified, :boolean, null: false)
     end
-
-    create(unique_index(:super_users, [:email], name: :unique_email_per_super_users))
 
     create(table(:super_user_roles, primary_key: false)) do
       add(:id, :uuid, null: false, primary_key: true)

@@ -60,7 +60,7 @@ defmodule Graphism.Migrations do
     m =
       Enum.reduce(e[:attributes], %{}, fn attr, m ->
         name = column_name_from_attribute(attr)
-        type = column_type_from_attribute(attr)
+        type = column_type_from_attribute(attr, e)
         opts = column_opts_from_attribute(attr)
 
         Map.put(m, name, %{
@@ -88,14 +88,26 @@ defmodule Graphism.Migrations do
     indices =
       e[:attributes]
       |> Enum.filter(fn attr -> attr[:opts][:unique] end)
-      |> Enum.reduce([], fn attr, acc ->
-        [index_from_attribute(attr, e) | acc]
+      |> Enum.reduce(%{}, fn attr, acc ->
+        index = index_from_attribute(attr, e)
+        Map.put(acc, index[:name], index)
+      end)
+
+    # Inspect attributes and derive enums
+    enums =
+      e[:attributes]
+      |> Enum.filter(fn attr -> attr[:opts][:one_of] end)
+      |> Enum.reduce(%{}, fn attr, acc ->
+        enum = enum_from_attribute(attr, e)
+        Map.put(acc, enum[:enum], enum)
       end)
 
     Map.put(acc, e[:table], %{
       columns: m,
-      indices: indices
+      indices: indices,
+      enums: enums
     })
+    |> IO.inspect()
   end
 
   # Resolve an entity by name. This function raises an error
@@ -124,6 +136,7 @@ defmodule Graphism.Migrations do
     []
     |> column_opts_with_primary_key(attr)
     |> column_opts_with_null(attr)
+    |> column_opts_with_default(attr)
   end
 
   defp column_opts_with_primary_key(opts, attr) do
@@ -146,18 +159,40 @@ defmodule Graphism.Migrations do
     end
   end
 
-  defp column_type_from_attribute(attr) do
+  defp column_opts_with_default(opts, attr) do
+    case attr[:opts][:default] do
+      nil ->
+        opts
+
+      default ->
+        default =
+          case is_atom(default) do
+            true ->
+              Atom.to_string(default)
+
+            false ->
+              default
+          end
+
+        Keyword.put(opts, :default, default)
+    end
+  end
+
+  defp column_type_from_attribute(attr, e) do
     kind = attr[:kind]
 
     unless kind do
       raise "entity attribute #{inspect(attr)} has no kind"
     end
 
-    case kind do
-      :id ->
+    cond do
+      :id == kind ->
         :uuid
 
-      _ ->
+      nil != attr[:opts][:one_of] ->
+        enum_name(e, attr)
+
+      true ->
         kind
     end
   end
@@ -172,13 +207,24 @@ defmodule Graphism.Migrations do
     [table: e[:table], name: index_name, columns: [column_name]]
   end
 
+  defp enum_name(e, attr) do
+    String.to_atom("#{e[:table]}_#{attr[:name]}")
+  end
+
+  defp enum_from_attribute(attr, e) do
+    [enum: enum_name(e, attr), table: e[:table], values: attr[:opts][:one_of]]
+  end
+
   defp missing_migrations(existing, schema) do
     # New tables to be created
     tables_to_create = Map.keys(schema) -- Map.keys(existing)
 
     missing_migrations =
       Enum.reduce(tables_to_create, [], fn name, acc ->
-        [create_table_migration(name, schema)] ++ create_indices_migrations(name, schema) ++ acc
+        [create_table_migration(name, schema)] ++
+          create_indices_migrations(name, schema) ++
+          create_enums_migration(name, schema) ++
+          acc
       end)
 
     # Old tables to be dropped
@@ -225,8 +271,12 @@ defmodule Graphism.Migrations do
     [
       table: name,
       action: :create,
+      kind: :table,
       columns:
         Enum.map(schema[name][:columns], fn {col, spec} ->
+          # if the column matches an attribute that contains
+          # a one_of option, then we actually want to use 
+          # a database enum
           migration_from_column(col, spec, :add)
         end)
     ]
@@ -234,48 +284,20 @@ defmodule Graphism.Migrations do
 
   # Add migrations for new indices to be created for the given table
   defp create_indices_migrations(name, schema) do
-    case schema[name][:indices] do
-      [] ->
-        []
-
-      indices ->
-        Enum.map(indices, &create_index_migration(&1))
-    end
+    Enum.reduce(schema[name][:indices], [], fn {_, index}, acc ->
+      [create_index_migration(index) | acc]
+    end)
   end
-
-  # Look for existing indices for the given table name
-  # The lookup is performed on the schema built from the 
-  # existing migrations, which is reduced into 
-  # maps. 
-  # defp drop_indices_migrations(name, existing) do
-  #  case existing[name][:indices] do
-  #    [] ->
-  #      []
-
-  #    indices ->
-  #      Enum.map(indices, fn {_, index} ->
-  #        # convert the index into a keyword list
-  #        # for consistency with other use cases where we
-  #        # are building the index from the current schema
-  #        index
-  #        |> Keyword.new()
-  #        |> drop_index_migration()
-  #      end)
-  #  end
-  # end
 
   defp create_index_migration(index) do
     index_migration(index, :create)
   end
 
-  # defp drop_index_migration(index) do
-  #  index_migration(index, :drop)
-  # end
-
   defp index_migration(index, action) do
     [
       index: index[:name],
       action: action,
+      kind: :index,
       table: index[:table],
       columns: index[:columns]
     ]
@@ -284,14 +306,24 @@ defmodule Graphism.Migrations do
   defp drop_table_migration(name) do
     [
       table: name,
-      action: :drop
+      action: :drop,
+      kind: :table
     ]
+  end
+
+  defp create_enums_migration(name, schema) do
+    Enum.reduce(schema[name][:enums], [], fn {_, e}, acc ->
+      enum = [enum: e[:enum], action: :create, kind: :enum, table: name, values: e[:values]]
+
+      [enum | acc]
+    end)
   end
 
   defp alter_table_migration(name, columns_to_add, columns_to_remove) do
     [
       table: name,
       action: :alter,
+      kind: :table,
       columns:
         Enum.map(columns_to_add, fn col ->
           [column: col[:column], type: col[:type], opts: col[:opts], action: :add]
@@ -303,7 +335,7 @@ defmodule Graphism.Migrations do
   end
 
   defp migration_from_column(col, spec, action) do
-    [column: col, type: spec[:type], opts: spec[:opts], action: action]
+    [column: col, type: spec[:type], opts: spec[:opts], action: action, kind: :column]
   end
 
   defp existing_migrations() do
@@ -324,11 +356,14 @@ defmodule Graphism.Migrations do
     |> Enum.reduce(%{}, &reduce_migration(&1, &2))
   end
 
-  defp reduce_migration([table: t, action: :drop_if_exists, opts: _, columns: _], acc) do
+  defp reduce_migration(
+         [table: t, action: :drop_if_exists, kind: :table, opts: _, columns: _],
+         acc
+       ) do
     Map.drop(acc, [t])
   end
 
-  defp reduce_migration([table: t, action: :create, opts: _, columns: cols], acc) do
+  defp reduce_migration([table: t, action: :create, kind: :table, opts: _, columns: cols], acc) do
     # Since this is a create table migration,
     # all columns must be present. We just need to remove the
     # action on each column
@@ -342,7 +377,10 @@ defmodule Graphism.Migrations do
     Map.put(acc, t, %{indices: %{}, columns: cols})
   end
 
-  defp reduce_migration([index: name, action: :create, table: table, columns: columns], acc) do
+  defp reduce_migration(
+         [index: name, action: :create, kind: :index, table: table, columns: columns],
+         acc
+       ) do
     t = Map.get(acc, table)
 
     unless t do
@@ -363,7 +401,7 @@ defmodule Graphism.Migrations do
   end
 
   defp reduce_migration(
-         [index: name, action: :drop_if_exists, table: table, columns: _],
+         [index: name, action: :drop_if_exists, kind: :index, table: table, columns: _],
          acc
        ) do
     t = Map.get(acc, table)
@@ -380,7 +418,7 @@ defmodule Graphism.Migrations do
   end
 
   defp reduce_migration(
-         [table: t, action: :alter, opts: _, columns: column_changes] = spec,
+         [table: t, action: :alter, kind: :table, opts: _, columns: column_changes] = spec,
          acc
        ) do
     table = Map.get(acc, t)
@@ -413,6 +451,31 @@ defmodule Graphism.Migrations do
     # Then replace the resulting table columns
     # in our accumulator
     put_in(acc, [t, :columns], new_columns)
+  end
+
+  defp reduce_migration([enum: enum, action: :create, kind: :enum, table: t, values: values], acc) do
+    table =
+      case Map.get(acc, t) do
+        nil ->
+          # Usually we create enums before we create the tables where
+          # they are used so it is expected that the table might not
+          # be there yet
+          %{columns: %{}, indices: [], enums: %{}}
+
+        table ->
+          table
+      end
+
+    enums =
+      table
+      |> Map.get(:enums)
+      |> Map.put(enum, %{
+        enum: enum,
+        values: values
+      })
+
+    table = Map.put(table, :enums, enums)
+    Map.put(acc, t, table)
   end
 
   defp last_migration_version(migrations) do
@@ -581,6 +644,16 @@ defmodule Graphism.Migrations do
     index_change(table, action, columns, opts)
   end
 
+  defp parse_up(
+         {:execute, _,
+          [
+            "create type " <> enum_expr
+          ]}
+       ) do
+    {enum, table, values} = parse_enum_expression(enum_expr)
+    enum_change(enum, :create, table, values)
+  end
+
   defp parse_up(other) do
     Logger.warn(
       "Unable to parse migration code #{inspect(other)}: #{
@@ -608,7 +681,7 @@ defmodule Graphism.Migrations do
 
     table = table_name(table)
 
-    [table: table, action: action, opts: opts, columns: columns]
+    [table: table, action: action, kind: :table, opts: opts, columns: columns]
   end
 
   defp column_change({:timestamps, _, _}) do
@@ -616,19 +689,38 @@ defmodule Graphism.Migrations do
   end
 
   defp column_change({action, _, [name, type]}) do
-    [column: name, type: type, opts: [], action: action]
+    [column: name, type: type, opts: [], action: action, kind: :column]
   end
 
   defp column_change({action, _, [name, type, opts]}) do
-    [column: name, type: type, opts: opts, action: action]
+    [column: name, type: type, opts: opts, action: action, kind: :column]
   end
 
   defp column_change({action, _, [name]}) do
-    [column: name, action: action]
+    [column: name, action: action, kind: :column]
   end
 
   defp index_change(table, action, columns, opts) do
-    [index: opts[:name], action: action, table: table, columns: columns]
+    [index: opts[:name], action: action, kind: :index, table: table, columns: columns]
+  end
+
+  defp enum_change(enum, action, table, values) do
+    [enum: enum, action: action, kind: :enum, table: table, values: values]
+  end
+
+  defp parse_enum_expression(expr) do
+    [enum | values] =
+      expr
+      |> String.replace("as ENUM (", "")
+      |> String.replace(")", "")
+      |> String.replace("'", "")
+      |> String.replace(",", " ")
+      |> String.split(" ")
+
+    [table, _] = String.split(enum, "_")
+    table = String.to_atom(table)
+
+    {String.to_atom(enum), table, Enum.map(values, &String.to_atom(&1))}
   end
 
   defp write_migration([], _, _) do
@@ -675,8 +767,8 @@ defmodule Graphism.Migrations do
 
   # Figure out whether child migration depends on parent
   defp depends(child, parent) do
-    case child[:index] do
-      nil ->
+    case child[:kind] do
+      :table ->
         # we are dealing with a table
         # See if there is a foreign reference to the parent
         not (child[:columns]
@@ -685,9 +777,12 @@ defmodule Graphism.Migrations do
              end)
              |> Enum.empty?())
 
-      _ ->
+      :index ->
         # We are dealing with an index
         child[:table] == parent[:table]
+
+      :enum ->
+        false
     end
   end
 
@@ -717,7 +812,7 @@ defmodule Graphism.Migrations do
      ]}
   end
 
-  defp quote_migration(table: table, action: :create, columns: cols) do
+  defp quote_migration(table: table, action: :create, kind: :table, columns: cols) do
     {:create, [line: 1],
      [
        {:table, [line: 1], [table, [primary_key: false]]},
@@ -727,7 +822,7 @@ defmodule Graphism.Migrations do
      ]}
   end
 
-  defp quote_migration(table: table, action: :alter, columns: cols) do
+  defp quote_migration(table: table, action: :alter, kind: :table, columns: cols) do
     {:alter, [line: 1],
      [
        {:table, [line: 1], [table]},
@@ -737,30 +832,47 @@ defmodule Graphism.Migrations do
      ]}
   end
 
-  defp quote_migration(table: table, action: :drop) do
+  defp quote_migration(table: table, action: :drop, kind: :table) do
     {:drop_if_exists, [line: 1],
      [
        {:table, [line: 1], [table]}
      ]}
   end
 
-  defp quote_migration(index: index, action: :create, table: table, columns: columns) do
+  defp quote_migration(
+         index: index,
+         action: :create,
+         kind: :index,
+         table: table,
+         columns: columns
+       ) do
     {:create, [line: 1],
      [
        {:unique_index, [line: 1], [table, columns, [name: index]]}
      ]}
   end
 
-  defp quote_migration(index: index, action: :drop, table: table, columns: columns) do
+  defp quote_migration(index: index, action: :drop, kind: :index, table: table, columns: columns) do
     {:drop_if_exists, [line: 1],
      [
        {:index, [line: 1], [table, columns, [name: index]]}
      ]}
   end
 
+  defp quote_migration(enum: name, action: :create, kind: :enum, table: _, values: values) do
+    {:execute, [line: 1],
+     [
+       "create type #{name} as ENUM (#{
+         values
+         |> Enum.map(fn value -> "'#{value}'" end)
+         |> Enum.join(",")
+       })"
+     ]}
+  end
+
   # Given a column change, generate the AST that will be
   # included in a migration, inside a create/alter table block
-  defp column_change_ast(column: name, type: type, opts: opts, action: :add) do
+  defp column_change_ast(column: name, type: type, opts: opts, action: :add, kind: :column) do
     case opts do
       [] ->
         {:add, [], [name, type]}
@@ -780,7 +892,7 @@ defmodule Graphism.Migrations do
   # Translates a drop table change into the AST
   # that will be included in a migration, inside an alter
   # table block
-  defp column_change_ast(column: name, action: :remove) do
+  defp column_change_ast(column: name, action: :remove, kind: :column) do
     {:remove, [], [name]}
   end
 end
