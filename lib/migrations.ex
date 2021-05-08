@@ -42,7 +42,7 @@ defmodule Graphism.Migrations do
         table_name =
           e[:plural]
           |> Atom.to_string()
-          |> Recase.to_snake()
+          |> Inflex.parameterize("_")
           |> String.to_atom()
 
         e = Keyword.put(e, :table, table_name)
@@ -107,7 +107,6 @@ defmodule Graphism.Migrations do
       indices: indices,
       enums: enums
     })
-    |> IO.inspect()
   end
 
   # Resolve an entity by name. This function raises an error

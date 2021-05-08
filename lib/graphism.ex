@@ -35,9 +35,19 @@ defmodule Graphism do
         end
       end
 
+    schema_modules =
+      Enum.map(schema, fn e ->
+        schema_module(e, schema, caller: __CALLER__)
+      end)
+
     api_modules =
       Enum.map(schema, fn e ->
         api_module(e, schema, caller: __CALLER__)
+      end)
+
+    resolver_modules =
+      Enum.map(schema, fn e ->
+        resolver_module(e, schema, caller: __CALLER__)
       end)
 
     enums =
@@ -72,7 +82,16 @@ defmodule Graphism do
         end
       end
 
-    List.flatten([schema_fun, api_modules, enums, objects, queries, mutations])
+    List.flatten([
+      schema_fun,
+      schema_modules,
+      api_modules,
+      resolver_modules,
+      enums,
+      objects,
+      queries,
+      mutations
+    ])
   end
 
   defmacro entity(name, _attrs \\ [], do: block) do
@@ -83,8 +102,9 @@ defmodule Graphism do
       [name: name, attributes: attrs, relations: rels, enums: []]
       |> with_plural()
       |> with_schema_module()
+      |> with_api_module()
+      |> with_resolver_module()
       |> with_enums()
-      |> IO.inspect()
 
     Module.put_attribute(__CALLER__.module, :schema, entity)
 
@@ -114,15 +134,28 @@ defmodule Graphism do
   end
 
   defp with_schema_module(entity) do
+    module_name(entity, :schema_module, :schema)
+  end
+
+  defp with_resolver_module(entity) do
+    module_name(entity, :resolver_module, :resolver)
+  end
+
+  defp with_api_module(entity) do
+    module_name(entity, :api_module, :api)
+  end
+
+  defp module_name(entity, name, suffix) do
     module_name =
-      [entity[:name], :schema]
+      [entity[:name], suffix]
+      |> Enum.reject(fn part -> part == nil end)
       |> Enum.map(&Atom.to_string(&1))
-      |> Enum.map(&String.capitalize(&1))
+      |> Enum.map(&Inflex.camelize(&1))
       |> Module.concat()
 
     Keyword.put(
       entity,
-      :schema_module,
+      name,
       module_name
     )
   end
@@ -170,21 +203,20 @@ defmodule Graphism do
   end
 
   def with_display_name(e) do
-    display_name =
-      e[:name]
-      |> Atom.to_string()
-      |> Recase.to_camel()
-      |> :string.titlecase()
+    display_name = display_name(e[:name])
 
-    plural_display_name =
-      e[:plural]
-      |> Atom.to_string()
-      |> Recase.to_camel()
-      |> :string.titlecase()
+    plural_display_name = display_name(e[:plural])
 
     e
     |> Keyword.put(:display_name, display_name)
     |> Keyword.put(:plural_display_name, plural_display_name)
+  end
+
+  defp display_name(name) when is_atom(name) do
+    name
+    |> Atom.to_string()
+    |> Inflex.camelize()
+    |> :string.titlecase()
   end
 
   # Ensure all relations are properly formed. 
@@ -226,7 +258,7 @@ defmodule Graphism do
     Keyword.put(e, :relations, relations)
   end
 
-  defp api_module(e, _schema, _opts) do
+  defp schema_module(e, _schema, _opts) do
     quote do
       defmodule unquote(e[:schema_module]) do
         use Ecto.Schema
@@ -245,6 +277,69 @@ defmodule Graphism do
 
           timestamps()
         end
+      end
+    end
+  end
+
+  defp resolver_module(e, _, _) do
+    api_module = e[:api_module]
+
+    quote do
+      defmodule unquote(e[:resolver_module]) do
+        def query_all(_, _, _) do
+          {:ok, unquote(api_module).list()}
+        end
+
+        def query_by_id(_, %{id: id}, _) do
+          unquote(api_module).get(id)
+        end
+
+        unquote do
+          e[:attributes]
+          |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+          |> Enum.map(fn attr ->
+            quote do
+              def unquote(query_function_for(attr))(
+                    _,
+                    %{unquote(attr[:name]) => arg},
+                    _
+                  ) do
+                unquote(api_module).unquote(api_get_function_for(attr))(arg)
+              end
+            end
+          end)
+        end
+
+        unquote do
+          e[:relations]
+          |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+          |> Enum.map(fn rel ->
+            quote do
+              def unquote(query_function_for(rel))(_, %{unquote(rel[:name]) => arg}, _) do
+                {:ok, unquote(api_module).unquote(api_list_function_for(rel))(arg)}
+              end
+            end
+          end)
+        end
+      end
+    end
+  end
+
+  defp query_function_for(field) do
+    String.to_atom("query_by_#{field[:name]}")
+  end
+
+  defp api_get_function_for(field) do
+    String.to_atom("get_by_#{field[:name]}")
+  end
+
+  defp api_list_function_for(field) do
+    String.to_atom("list_by_#{field[:name]}")
+  end
+
+  defp api_module(e, _, _) do
+    quote do
+      defmodule unquote(e[:api_module]) do
       end
     end
   end
@@ -317,9 +412,7 @@ defmodule Graphism do
     quote do
       @desc "List all " <> unquote("#{e[:plural_display_name]}")
       field unquote(e[:plural]), list_of(unquote(e[:name])) do
-        resolve(fn _, _, _ ->
-          {:ok, []}
-        end)
+        resolve(&unquote(e[:resolver_module]).query_all/3)
       end
     end
   end
@@ -329,9 +422,8 @@ defmodule Graphism do
       @desc "Find a single " <> unquote("#{e[:display_name]}") <> " given its unique id"
       field unquote(String.to_atom("#{e[:name]}_by_id")),
             unquote(e[:name]) do
-        resolve(fn _, _, _ ->
-          {:ok, []}
-        end)
+        arg(:id, non_null(:id))
+        resolve(&unquote(e[:resolver_module]).query_by_id/3)
       end
     end
   end
@@ -346,9 +438,9 @@ defmodule Graphism do
                 " given its unique " <> unquote("#{attr[:name]}")
         field unquote(String.to_atom("#{e[:name]}_by_#{attr[:name]}")),
               unquote(e[:name]) do
-          resolve(fn _, _, _ ->
-            {:ok, []}
-          end)
+          arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
+
+          resolve(&(unquote(e[:resolver_module]).unquote(query_function_for(attr)) / 3))
         end
       end
     end)
@@ -364,9 +456,9 @@ defmodule Graphism do
                 " given their parent " <> unquote("#{rel[:target]}")
         field unquote(String.to_atom("#{e[:plural]}_by_#{rel[:name]}")),
               list_of(unquote(e[:name])) do
-          resolve(fn _, _, _ ->
-            {:ok, []}
-          end)
+          arg(unquote(rel[:name]), non_null(:id))
+
+          resolve(&(unquote(e[:resolver_module]).unquote(query_function_for(rel)) / 3))
         end
       end
     end)
