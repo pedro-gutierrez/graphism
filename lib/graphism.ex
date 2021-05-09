@@ -9,11 +9,24 @@ defmodule Graphism do
 
   require Logger
 
-  defmacro __using__(_opts \\ []) do
+  defmacro __using__(opts \\ []) do
+    repo = opts[:repo]
+
+    unless repo do
+      raise "Please specify a repo module when using Graphism"
+    end
+
     Module.register_attribute(__CALLER__.module, :schema,
       accumulate: true,
       persist: true
     )
+
+    Module.register_attribute(__CALLER__.module, :repo,
+      accumulate: false,
+      persist: true
+    )
+
+    Module.put_attribute(__CALLER__.module, :repo, opts[:repo])
 
     quote do
       @before_compile unquote(__MODULE__)
@@ -27,6 +40,10 @@ defmodule Graphism do
       __CALLER__.module
       |> Module.get_attribute(:schema)
       |> resolve()
+
+    repo =
+      __CALLER__.module
+      |> Module.get_attribute(:repo)
 
     schema_fun =
       quote do
@@ -42,7 +59,7 @@ defmodule Graphism do
 
     api_modules =
       Enum.map(schema, fn e ->
-        api_module(e, schema, caller: __CALLER__)
+        api_module(e, schema, repo: repo, caller: __CALLER__)
       end)
 
     resolver_modules =
@@ -134,7 +151,7 @@ defmodule Graphism do
   end
 
   defp with_schema_module(entity) do
-    module_name(entity, :schema_module, :schema)
+    module_name(entity, :schema_module)
   end
 
   defp with_resolver_module(entity) do
@@ -145,7 +162,7 @@ defmodule Graphism do
     module_name(entity, :api_module, :api)
   end
 
-  defp module_name(entity, name, suffix) do
+  defp module_name(entity, name, suffix \\ nil) do
     module_name =
       [entity[:name], suffix]
       |> Enum.reject(fn part -> part == nil end)
@@ -281,47 +298,182 @@ defmodule Graphism do
     end
   end
 
-  defp resolver_module(e, _, _) do
+  defp resolver_module(e, schema, _) do
     api_module = e[:api_module]
 
-    quote do
-      defmodule unquote(e[:resolver_module]) do
-        def query_all(_, _, _) do
-          {:ok, unquote(api_module).list()}
-        end
+    ast =
+      quote do
+        defmodule unquote(e[:resolver_module]) do
+          def query_all(_, _, _) do
+            {:ok, unquote(api_module).list()}
+          end
 
-        def query_by_id(_, %{id: id}, _) do
-          unquote(api_module).get(id)
-        end
+          def query_by_id(_, %{id: id}, _) do
+            unquote(api_module).get(id)
+          end
 
-        unquote do
-          e[:attributes]
-          |> Enum.filter(fn attr -> attr[:opts][:unique] end)
-          |> Enum.map(fn attr ->
-            quote do
-              def unquote(query_function_for(attr))(
-                    _,
-                    %{unquote(attr[:name]) => arg},
-                    _
-                  ) do
-                unquote(api_module).unquote(api_get_function_for(attr))(arg)
+          unquote_splicing(
+            e[:attributes]
+            |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+            |> Enum.map(fn attr ->
+              quote do
+                def unquote(query_function_for(attr))(
+                      _,
+                      %{unquote(attr[:name]) => arg},
+                      _
+                    ) do
+                  unquote(api_module).unquote(api_get_function_for(attr))(arg)
+                end
               end
-            end
-          end)
-        end
+            end)
+          )
 
-        unquote do
-          e[:relations]
-          |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-          |> Enum.map(fn rel ->
-            quote do
-              def unquote(query_function_for(rel))(_, %{unquote(rel[:name]) => arg}, _) do
-                {:ok, unquote(api_module).unquote(api_list_function_for(rel))(arg)}
+          unquote_splicing(
+            e[:relations]
+            |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+            |> Enum.map(fn rel ->
+              quote do
+                def unquote(query_function_for(rel))(_, %{unquote(rel[:name]) => arg}, _) do
+                  {:ok, unquote(api_module).unquote(api_list_function_for(rel))(arg)}
+                end
               end
+            end)
+          )
+
+          def create(_, args, _) do
+            unquote(
+              case Enum.filter(e[:relations], fn rel -> rel[:kind] == :belongs_to end) do
+                [] ->
+                  quote do
+                    unquote(api_module).create(args)
+                  end
+
+                rels ->
+                  quote do
+                    with unquote_splicing(
+                           rels
+                           |> Enum.map(fn rel ->
+                             parent_var = Macro.var(rel[:name], nil)
+                             target = find_entity!(schema, rel[:target])
+
+                             quote do
+                               {:ok, unquote(parent_var)} <-
+                                 unquote(target[:api_module]).get(args.unquote(rel[:name]))
+                             end
+                           end)
+                         ) do
+                      args = Map.drop(args, unquote(Enum.map(rels, fn rel -> rel[:name] end)))
+
+                      unquote(api_module).create(
+                        unquote_splicing(
+                          Enum.map(rels, fn rel ->
+                            Macro.var(rel[:name], nil)
+                          end)
+                        ),
+                        args
+                      )
+                    end
+                  end
+              end
+            )
+          end
+
+          def update(_, %{id: id} = args, _) do
+            with {:ok, entity} <- unquote(api_module).get(id) do
+              args = Map.drop(args, [:id])
+
+              unquote(
+                case Enum.filter(e[:relations], fn rel -> rel[:kind] == :belongs_to end) do
+                  [] ->
+                    quote do
+                      unquote(api_module).update(entity, args)
+                    end
+
+                  rels ->
+                    quote do
+                      with unquote_splicing(
+                             rels
+                             |> Enum.map(fn rel ->
+                               parent_var = Macro.var(rel[:name], nil)
+                               target = find_entity!(schema, rel[:target])
+
+                               quote do
+                                 {:ok, unquote(parent_var)} <-
+                                   unquote(target[:api_module]).get(args.unquote(rel[:name]))
+                               end
+                             end)
+                           ) do
+                        args = Map.drop(args, unquote(Enum.map(rels, fn rel -> rel[:name] end)))
+
+                        unquote(api_module).update(
+                          unquote_splicing(
+                            Enum.map(rels, fn rel ->
+                              Macro.var(rel[:name], nil)
+                            end)
+                          ),
+                          entity,
+                          args
+                        )
+                      end
+                    end
+                end
+              )
             end
-          end)
+          end
+
+          def delete(_, %{id: id}, _) do
+            with {:ok, entity} <- unquote(api_module).get(id) do
+              unquote(api_module).delete(entity)
+            end
+          end
         end
       end
+
+    mod = ast |> Macro.to_string() |> Code.format_string!()
+    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}.ex", mod)
+    ast
+  end
+
+  defp api_module(e, _, opts) do
+    schema_module = e[:schema_module]
+    repo_module = opts[:repo]
+
+    quote do
+      defmodule unquote(e[:api_module]) do
+        def list do
+          unquote(schema_module)
+          |> unquote(repo_module).all()
+        end
+
+        def create(attrs) do
+          IO.inspect(create: attrs)
+          {:ok, %{}}
+        end
+
+        def update(attrs) do
+          IO.inspect(update: attrs)
+          {:ok, %{}}
+        end
+
+        def delete(attrs) do
+          IO.inspect(delete: attrs)
+          {:ok, %{}}
+        end
+      end
+    end
+  end
+
+  defp find_entity!(schema, name) do
+    case Enum.filter(schema, fn e ->
+           name == e[:name]
+         end) do
+      [] ->
+        raise "Could not resolve entity #{name}: #{
+                inspect(Enum.map(schema, fn e -> e[:name] end))
+              }"
+
+      [e] ->
+        e
     end
   end
 
@@ -335,13 +487,6 @@ defmodule Graphism do
 
   defp api_list_function_for(field) do
     String.to_atom("list_by_#{field[:name]}")
-  end
-
-  defp api_module(e, _, _) do
-    quote do
-      defmodule unquote(e[:api_module]) do
-      end
-    end
   end
 
   defp graphql_object(e, _schema) do
@@ -493,9 +638,7 @@ defmodule Graphism do
              end))
         )
 
-        resolve(fn _, _, _ ->
-          {:ok, %{}}
-        end)
+        resolve(&unquote(e[:resolver_module]).create/3)
       end
     end
   end
@@ -521,9 +664,7 @@ defmodule Graphism do
              end))
         )
 
-        resolve(fn _, _, _ ->
-          {:ok, %{}}
-        end)
+        resolve(&unquote(e[:resolver_module]).update/3)
       end
     end
   end
@@ -535,10 +676,7 @@ defmodule Graphism do
       @desc "Delete an existing " <> unquote("#{e[:display_name]}")
       field unquote(mutation_name), unquote(e[:name]) do
         arg(:id, non_null(:id))
-
-        resolve(fn _, _, _ ->
-          {:ok, %{}}
-        end)
+        resolve(&unquote(e[:resolver_module]).delete/3)
       end
     end
   end

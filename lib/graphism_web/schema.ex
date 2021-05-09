@@ -1,5 +1,6 @@
 defmodule GraphismWeb.Schema do
-  use Graphism
+  use Graphism,
+    repo: Graphism.Repo
 
   entity :super_user do
     attribute(:id, :id)
