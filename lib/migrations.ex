@@ -39,13 +39,6 @@ defmodule Graphism.Migrations do
     # using plurals and table names from referenced entities
     index =
       Enum.reduce(schema, %{}, fn e, acc ->
-        table_name =
-          e[:plural]
-          |> Atom.to_string()
-          |> Inflex.parameterize("_")
-          |> String.to_atom()
-
-        e = Keyword.put(e, :table, table_name)
         Map.put(acc, e[:name], e)
       end)
 
@@ -670,6 +663,7 @@ defmodule Graphism.Migrations do
     columns =
       columns
       |> Enum.map(&column_change(&1))
+      |> Enum.reject(fn col -> col[:column] == nil end)
       |> Enum.reduce(%{}, fn col, map ->
         Map.put(map, col[:column], %{
           type: col[:type],
@@ -816,7 +810,7 @@ defmodule Graphism.Migrations do
      [
        {:table, [line: 1], [table, [primary_key: false]]},
        [
-         do: {:__block__, [], Enum.map(cols, &column_change_ast(&1))}
+         do: {:__block__, [], Enum.map(cols, &column_change_ast(&1)) ++ [timestamps_ast()]}
        ]
      ]}
   end
@@ -893,5 +887,9 @@ defmodule Graphism.Migrations do
   # table block
   defp column_change_ast(column: name, action: :remove, kind: :column) do
     {:remove, [], [name]}
+  end
+
+  defp timestamps_ast() do
+    {:timestamps, [line: 1], []}
   end
 end

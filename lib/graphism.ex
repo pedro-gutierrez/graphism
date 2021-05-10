@@ -80,35 +80,46 @@ defmodule Graphism do
     queries =
       quote do
         query do
-          unquote do
-            Enum.flat_map(schema, fn e ->
-              graphql_queries(e, schema)
-            end)
-          end
+          (unquote_splicing(
+             Enum.flat_map(schema, fn e ->
+               graphql_queries(e, schema)
+             end)
+           ))
         end
       end
 
     mutations =
       quote do
         mutation do
-          unquote do
-            Enum.flat_map(schema, fn e ->
-              graphql_mutations(e, schema)
-            end)
-          end
+          (unquote_splicing(
+             Enum.flat_map(schema, fn e ->
+               graphql_mutations(e, schema)
+             end)
+           ))
         end
       end
 
-    List.flatten([
-      schema_fun,
-      schema_modules,
-      api_modules,
-      resolver_modules,
-      enums,
-      objects,
-      queries,
-      mutations
-    ])
+    asts =
+      List.flatten([
+        schema_fun,
+        schema_modules,
+        api_modules,
+        resolver_modules,
+        enums,
+        objects,
+        queries,
+        mutations
+      ])
+
+    asts
+    |> Enum.with_index()
+    |> Enum.map(fn {ast, index} ->
+      data = Macro.to_string(ast)
+      data = Code.format_string!(data)
+      File.write!("/Users/pedrogutierrez/Desktop/#{index}.ex", data)
+    end)
+
+    asts
   end
 
   defmacro entity(name, _attrs \\ [], do: block) do
@@ -118,6 +129,7 @@ defmodule Graphism do
     entity =
       [name: name, attributes: attrs, relations: rels, enums: []]
       |> with_plural()
+      |> with_table_name()
       |> with_schema_module()
       |> with_api_module()
       |> with_resolver_module()
@@ -148,6 +160,16 @@ defmodule Graphism do
       _ ->
         entity
     end
+  end
+
+  defp with_table_name(entity) do
+    table_name =
+      entity[:plural]
+      |> Atom.to_string()
+      |> Inflex.parameterize("_")
+      |> String.to_atom()
+
+    Keyword.put(entity, :table, table_name)
   end
 
   defp with_schema_module(entity) do
@@ -276,26 +298,62 @@ defmodule Graphism do
   end
 
   defp schema_module(e, _schema, _opts) do
-    quote do
-      defmodule unquote(e[:schema_module]) do
-        use Ecto.Schema
-        import Ecto.Changeset
+    ast =
+      quote do
+        defmodule unquote(e[:schema_module]) do
+          use Ecto.Schema
+          import Ecto.Changeset
 
-        schema unquote("#{e[:plural]}") do
-          unquote do
-            e[:attributes]
-            |> Enum.reject(fn attr -> attr[:name] == :id end)
-            |> Enum.map(fn attr ->
-              quote do
-                Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:kind]))
-              end
-            end)
+          @primary_key {:id, :binary_id, autogenerate: false}
+
+          schema unquote("#{e[:plural]}") do
+            unquote_splicing(
+              e[:attributes]
+              |> Enum.reject(fn attr -> attr[:name] == :id end)
+              |> Enum.map(fn attr ->
+                quote do
+                  Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:kind]))
+                end
+              end)
+            )
+
+            timestamps()
           end
 
-          timestamps()
+          @required_fields unquote(
+                             e[:attributes]
+                             |> Enum.map(fn attr ->
+                               attr[:name]
+                             end)
+                           )
+
+          def changeset(e, attrs) do
+            changes =
+              e
+              |> cast(attrs, @required_fields)
+              |> unique_constraint(:id, name: unquote("#{e[:table]}_pkey"))
+
+            unquote_splicing(
+              e[:attributes]
+              |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+              |> Enum.map(fn attr ->
+                quote do
+                  changes =
+                    changes
+                    |> unique_constraint(
+                      unquote(attr[:name]),
+                      name: unquote("unique_#{attr[:name]}_per_#{e[:table]}")
+                    )
+                end
+              end)
+            )
+          end
         end
       end
-    end
+
+    mod = ast |> Macro.to_string() |> Code.format_string!()
+    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}_schema.ex", mod)
+    ast
   end
 
   defp resolver_module(e, schema, _) do
@@ -304,12 +362,12 @@ defmodule Graphism do
     ast =
       quote do
         defmodule unquote(e[:resolver_module]) do
-          def query_all(_, _, _) do
+          def list_all(_, _, _) do
             {:ok, unquote(api_module).list()}
           end
 
-          def query_by_id(_, %{id: id}, _) do
-            unquote(api_module).get(id)
+          def get_by_id(_, %{id: id}, _) do
+            unquote(api_module).get_by_id(id)
           end
 
           unquote_splicing(
@@ -317,12 +375,12 @@ defmodule Graphism do
             |> Enum.filter(fn attr -> attr[:opts][:unique] end)
             |> Enum.map(fn attr ->
               quote do
-                def unquote(query_function_for(attr))(
+                def unquote(String.to_atom("get_by_#{attr[:name]}"))(
                       _,
                       %{unquote(attr[:name]) => arg},
                       _
                     ) do
-                  unquote(api_module).unquote(api_get_function_for(attr))(arg)
+                  unquote(api_module).unquote(String.to_atom("get_by_#{attr[:name]}"))(arg)
                 end
               end
             end)
@@ -333,8 +391,12 @@ defmodule Graphism do
             |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
             |> Enum.map(fn rel ->
               quote do
-                def unquote(query_function_for(rel))(_, %{unquote(rel[:name]) => arg}, _) do
-                  {:ok, unquote(api_module).unquote(api_list_function_for(rel))(arg)}
+                def unquote(String.to_atom("list_by_#{rel[:name]}"))(
+                      _,
+                      %{unquote(rel[:name]) => arg},
+                      _
+                    ) do
+                  {:ok, unquote(api_module).unquote(String.to_atom("list_by_#{rel[:name]}"))(arg)}
                 end
               end
             end)
@@ -358,7 +420,7 @@ defmodule Graphism do
 
                              quote do
                                {:ok, unquote(parent_var)} <-
-                                 unquote(target[:api_module]).get(args.unquote(rel[:name]))
+                                 unquote(target[:api_module]).get_by_id(args.unquote(rel[:name]))
                              end
                            end)
                          ) do
@@ -399,7 +461,9 @@ defmodule Graphism do
 
                                quote do
                                  {:ok, unquote(parent_var)} <-
-                                   unquote(target[:api_module]).get(args.unquote(rel[:name]))
+                                   unquote(target[:api_module]).get_by_id(
+                                     args.unquote(rel[:name])
+                                   )
                                end
                              end)
                            ) do
@@ -422,7 +486,7 @@ defmodule Graphism do
           end
 
           def delete(_, %{id: id}, _) do
-            with {:ok, entity} <- unquote(api_module).get(id) do
+            with {:ok, entity} <- unquote(api_module).get_by_id(id) do
               unquote(api_module).delete(entity)
             end
           end
@@ -438,29 +502,127 @@ defmodule Graphism do
     schema_module = e[:schema_module]
     repo_module = opts[:repo]
 
-    quote do
-      defmodule unquote(e[:api_module]) do
-        def list do
-          unquote(schema_module)
-          |> unquote(repo_module).all()
-        end
+    ast =
+      quote do
+        defmodule unquote(e[:api_module]) do
+          def list do
+            unquote(schema_module)
+            |> unquote(repo_module).all()
+          end
 
-        def create(attrs) do
-          IO.inspect(create: attrs)
-          {:ok, %{}}
-        end
+          def get_by_id(id) do
+            case unquote(schema_module)
+                 |> unquote(repo_module).get(id) do
+              nil ->
+                {:error, :not_found}
 
-        def update(attrs) do
-          IO.inspect(update: attrs)
-          {:ok, %{}}
-        end
+              e ->
+                {:ok, e}
+            end
+          end
 
-        def delete(attrs) do
-          IO.inspect(delete: attrs)
-          {:ok, %{}}
+          unquote_splicing(
+            e[:attributes]
+            |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+            |> Enum.map(fn attr ->
+              quote do
+                def unquote(String.to_atom("get_by_#{attr[:name]}"))(value) do
+                  value =
+                    case is_atom(value) do
+                      true ->
+                        "#{value}"
+
+                      false ->
+                        value
+                    end
+
+                  case unquote(schema_module)
+                       |> unquote(repo_module).get_by([{unquote(attr[:name]), value}]) do
+                    nil ->
+                      {:error, :not_found}
+
+                    e ->
+                      {:ok, e}
+                  end
+                end
+              end
+            end)
+          )
+
+          def create(
+                unquote_splicing(
+                  e[:relations]
+                  |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+                  |> Enum.map(fn rel -> Macro.var(rel[:name], nil) end)
+                ),
+                attrs
+              ) do
+            unquote_splicing(
+              e[:relations]
+              |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+              |> Enum.map(fn rel ->
+                quote do
+                  attrs =
+                    attrs
+                    |> Map.put(
+                      unquote(String.to_atom("#{rel[:name]}_id")),
+                      unquote(Macro.var(rel[:name], nil)).id
+                    )
+                end
+              end)
+            )
+
+            with {:ok, e} <-
+                   %unquote(schema_module){}
+                   |> unquote(schema_module).changeset(attrs)
+                   |> unquote(repo_module).insert() do
+              get_by_id(e.id)
+            end
+          end
+
+          def update(
+                unquote_splicing(
+                  e[:relations]
+                  |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+                  |> Enum.map(fn rel ->
+                    Macro.var(rel[:name], nil)
+                  end)
+                ),
+                unquote(Macro.var(e[:name], nil)),
+                attrs
+              ) do
+            unquote_splicing(
+              e[:relations]
+              |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+              |> Enum.map(fn rel ->
+                quote do
+                  attrs =
+                    attrs
+                    |> Map.put(
+                      unquote(String.to_atom("#{rel[:name]}_id")),
+                      unquote(Macro.var(rel[:name], nil)).id
+                    )
+                end
+              end)
+            )
+
+            with {:ok, unquote(Macro.var(e[:name], nil))} <-
+                   unquote(Macro.var(e[:name], nil))
+                   |> unquote(schema_module).changeset(attrs)
+                   |> unquote(repo_module).update() do
+              get_by_id(unquote(Macro.var(e[:name], nil)).id)
+            end
+          end
+
+          def delete(%unquote(schema_module){} = e) do
+            unquote(repo_module).delete(e)
+          end
         end
       end
-    end
+
+    mod = ast |> Macro.to_string() |> Code.format_string!()
+    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}_api.ex", mod)
+    ast
   end
 
   defp find_entity!(schema, name) do
@@ -477,61 +639,52 @@ defmodule Graphism do
     end
   end
 
-  defp query_function_for(field) do
-    String.to_atom("query_by_#{field[:name]}")
-  end
+  defp attr_graphql_type(e, attr) do
+    case attr[:opts][:one_of] do
+      nil ->
+        # it is not an enum, so we use its defined type
+        attr[:kind]
 
-  defp api_get_function_for(field) do
-    String.to_atom("get_by_#{field[:name]}")
-  end
-
-  defp api_list_function_for(field) do
-    String.to_atom("list_by_#{field[:name]}")
+      [_ | _] ->
+        # use the name of the enum as the type
+        enum_name(e, attr)
+    end
   end
 
   defp graphql_object(e, _schema) do
     quote do
       object unquote(e[:name]) do
-        unquote do
-          # Add a field for each attribute
-          Enum.map(e[:attributes], fn attr ->
-            # determine the kind for this field, depending
-            # on whether it is an enum or not
-            kind =
-              case attr[:opts][:one_of] do
-                nil ->
-                  # it is not an enum, so we use its defined type
-                  attr[:kind]
+        (unquote_splicing(
+           # Add a field for each attribute
+           Enum.map(e[:attributes], fn attr ->
+             # determine the kind for this field, depending
+             # on whether it is an enum or not
+             kind = attr_graphql_type(e, attr)
 
-                [_ | _] ->
-                  # use the name of the enum as the type
-                  enum_name(e, attr)
-              end
+             quote do
+               field unquote(attr[:name]), unquote(kind)
+             end
+           end) ++
+             Enum.map(e[:relations], fn rel ->
+               # Add a field for each relation
+               quote do
+                 field unquote(rel[:name]),
+                       unquote(
+                         case rel[:kind] do
+                           :has_many ->
+                             quote do
+                               list_of(unquote(rel[:target]))
+                             end
 
-            quote do
-              field unquote(attr[:name]), unquote(kind)
-            end
-          end) ++
-            Enum.map(e[:relations], fn rel ->
-              # Add a field for each relation
-              quote do
-                field unquote(rel[:name]),
-                      unquote(
-                        case rel[:kind] do
-                          :has_many ->
-                            quote do
-                              list_of(unquote(rel[:target]))
-                            end
-
-                          _ ->
-                            quote do
-                              non_null(unquote(rel[:target]))
-                            end
-                        end
-                      )
-              end
-            end)
-        end
+                           _ ->
+                             quote do
+                               non_null(unquote(rel[:target]))
+                             end
+                         end
+                       )
+               end
+             end)
+         ))
       end
     end
   end
@@ -539,7 +692,15 @@ defmodule Graphism do
   defp graphql_enum(e, _) do
     Enum.map(e[:enums], fn enum ->
       quote do
-        enum(unquote(enum[:name]), values: unquote(enum[:values]))
+        enum unquote(enum[:name]) do
+          (unquote_splicing(
+             Enum.map(enum[:values], fn value ->
+               quote do
+                 value(unquote(value), as: unquote("#{value}"))
+               end
+             end)
+           ))
+        end
       end
     end)
   end
@@ -557,7 +718,8 @@ defmodule Graphism do
     quote do
       @desc "List all " <> unquote("#{e[:plural_display_name]}")
       field unquote(e[:plural]), list_of(unquote(e[:name])) do
-        resolve(&unquote(e[:resolver_module]).query_all/3)
+        resolve(&unquote(e[:resolver_module]).list_all/3)
+        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -568,7 +730,8 @@ defmodule Graphism do
       field unquote(String.to_atom("#{e[:name]}_by_id")),
             unquote(e[:name]) do
         arg(:id, non_null(:id))
-        resolve(&unquote(e[:resolver_module]).query_by_id/3)
+        resolve(&unquote(e[:resolver_module]).get_by_id/3)
+        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -577,15 +740,21 @@ defmodule Graphism do
     e[:attributes]
     |> Enum.filter(fn attr -> Keyword.get(attr[:opts], :unique) end)
     |> Enum.map(fn attr ->
+      kind = attr_graphql_type(e, attr)
+
       quote do
         @desc "Find a single " <>
                 unquote("#{e[:display_name]}") <>
                 " given its unique " <> unquote("#{attr[:name]}")
         field unquote(String.to_atom("#{e[:name]}_by_#{attr[:name]}")),
               unquote(e[:name]) do
-          arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
+          arg(unquote(attr[:name]), non_null(unquote(kind)))
 
-          resolve(&(unquote(e[:resolver_module]).unquote(query_function_for(attr)) / 3))
+          resolve(
+            &(unquote(e[:resolver_module]).unquote(String.to_atom("get_by_#{attr[:name]}")) / 3)
+          )
+
+          middleware(Graphism.ErrorMiddleware)
         end
       end
     end)
@@ -603,7 +772,11 @@ defmodule Graphism do
               list_of(unquote(e[:name])) do
           arg(unquote(rel[:name]), non_null(:id))
 
-          resolve(&(unquote(e[:resolver_module]).unquote(query_function_for(rel)) / 3))
+          resolve(
+            &(unquote(e[:resolver_module]).unquote(String.to_atom("list_by_#{rel[:name]}")) / 3)
+          )
+
+          middleware(Graphism.ErrorMiddleware)
         end
       end
     end)
@@ -621,12 +794,14 @@ defmodule Graphism do
     mutation_name = String.to_atom("create_#{e[:name]}")
 
     quote do
-      @desc "Create a new " <> unquote("#{e[:display_name]}")
+      @desc unquote("Create a new #{e[:display_name]}")
       field unquote(mutation_name), non_null(unquote(e[:name])) do
-        unquote(
+        unquote_splicing(
           Enum.map(e[:attributes], fn attr ->
+            kind = attr_graphql_type(e, attr)
+
             quote do
-              arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
+              arg(unquote(attr[:name]), non_null(unquote(kind)))
             end
           end) ++
             (e[:relations]
@@ -639,6 +814,7 @@ defmodule Graphism do
         )
 
         resolve(&unquote(e[:resolver_module]).create/3)
+        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -647,9 +823,9 @@ defmodule Graphism do
     mutation_name = String.to_atom("update_#{e[:name]}")
 
     quote do
-      @desc "Update an existing " <> unquote("#{e[:display_name]}")
+      @desc unquote("Update an existing #{e[:display_name]}")
       field unquote(mutation_name), non_null(unquote(e[:name])) do
-        unquote(
+        unquote_splicing(
           Enum.map(e[:attributes], fn attr ->
             quote do
               arg(unquote(attr[:name]), non_null(unquote(attr[:kind])))
@@ -665,6 +841,7 @@ defmodule Graphism do
         )
 
         resolve(&unquote(e[:resolver_module]).update/3)
+        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -677,6 +854,7 @@ defmodule Graphism do
       field unquote(mutation_name), unquote(e[:name]) do
         arg(:id, non_null(:id))
         resolve(&unquote(e[:resolver_module]).delete/3)
+        middleware(Graphism.ErrorMiddleware)
       end
     end
   end

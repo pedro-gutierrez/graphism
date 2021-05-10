@@ -26,6 +26,7 @@ defmodule GraphismWeb.Schema do
   end
 
   entity :permission do
+    belongs_to(:role)
     attribute(:id, :id)
     attribute(:name, :string, unique: true)
   end
