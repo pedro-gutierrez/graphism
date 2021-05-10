@@ -99,27 +99,16 @@ defmodule Graphism do
         end
       end
 
-    asts =
-      List.flatten([
-        schema_fun,
-        schema_modules,
-        api_modules,
-        resolver_modules,
-        enums,
-        objects,
-        queries,
-        mutations
-      ])
-
-    asts
-    |> Enum.with_index()
-    |> Enum.map(fn {ast, index} ->
-      data = Macro.to_string(ast)
-      data = Code.format_string!(data)
-      File.write!("/Users/pedrogutierrez/Desktop/#{index}.ex", data)
-    end)
-
-    asts
+    List.flatten([
+      schema_fun,
+      schema_modules,
+      api_modules,
+      resolver_modules,
+      enums,
+      objects,
+      queries,
+      mutations
+    ])
   end
 
   defmacro entity(name, _attrs \\ [], do: block) do
@@ -298,116 +287,151 @@ defmodule Graphism do
   end
 
   defp schema_module(e, _schema, _opts) do
-    ast =
-      quote do
-        defmodule unquote(e[:schema_module]) do
-          use Ecto.Schema
-          import Ecto.Changeset
+    quote do
+      defmodule unquote(e[:schema_module]) do
+        use Ecto.Schema
+        import Ecto.Changeset
 
-          @primary_key {:id, :binary_id, autogenerate: false}
+        @primary_key {:id, :binary_id, autogenerate: false}
 
-          schema unquote("#{e[:plural]}") do
-            unquote_splicing(
-              e[:attributes]
-              |> Enum.reject(fn attr -> attr[:name] == :id end)
-              |> Enum.map(fn attr ->
-                quote do
-                  Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:kind]))
-                end
-              end)
-            )
+        schema unquote("#{e[:plural]}") do
+          unquote_splicing(
+            e[:attributes]
+            |> Enum.reject(fn attr -> attr[:name] == :id end)
+            |> Enum.map(fn attr ->
+              quote do
+                Ecto.Schema.field(unquote(attr[:name]), unquote(attr[:kind]))
+              end
+            end)
+          )
 
-            timestamps()
-          end
-
-          @required_fields unquote(
-                             e[:attributes]
-                             |> Enum.map(fn attr ->
-                               attr[:name]
-                             end)
-                           )
-
-          def changeset(e, attrs) do
-            changes =
-              e
-              |> cast(attrs, @required_fields)
-              |> unique_constraint(:id, name: unquote("#{e[:table]}_pkey"))
-
-            unquote_splicing(
-              e[:attributes]
-              |> Enum.filter(fn attr -> attr[:opts][:unique] end)
-              |> Enum.map(fn attr ->
-                quote do
-                  changes =
-                    changes
-                    |> unique_constraint(
-                      unquote(attr[:name]),
-                      name: unquote("unique_#{attr[:name]}_per_#{e[:table]}")
-                    )
-                end
-              end)
-            )
-          end
+          timestamps()
         end
-      end
 
-    mod = ast |> Macro.to_string() |> Code.format_string!()
-    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}_schema.ex", mod)
-    ast
-  end
+        @required_fields unquote(
+                           e[:attributes]
+                           |> Enum.map(fn attr ->
+                             attr[:name]
+                           end)
+                         )
 
-  defp resolver_module(e, schema, _) do
-    api_module = e[:api_module]
-
-    ast =
-      quote do
-        defmodule unquote(e[:resolver_module]) do
-          def list_all(_, _, _) do
-            {:ok, unquote(api_module).list()}
-          end
-
-          def get_by_id(_, %{id: id}, _) do
-            unquote(api_module).get_by_id(id)
-          end
+        def changeset(e, attrs) do
+          changes =
+            e
+            |> cast(attrs, @required_fields)
+            |> unique_constraint(:id, name: unquote("#{e[:table]}_pkey"))
 
           unquote_splicing(
             e[:attributes]
             |> Enum.filter(fn attr -> attr[:opts][:unique] end)
             |> Enum.map(fn attr ->
               quote do
-                def unquote(String.to_atom("get_by_#{attr[:name]}"))(
-                      _,
-                      %{unquote(attr[:name]) => arg},
-                      _
-                    ) do
-                  unquote(api_module).unquote(String.to_atom("get_by_#{attr[:name]}"))(arg)
-                end
+                changes =
+                  changes
+                  |> unique_constraint(
+                    unquote(attr[:name]),
+                    name: unquote("unique_#{attr[:name]}_per_#{e[:table]}")
+                  )
               end
             end)
           )
+        end
+      end
+    end
+  end
 
-          unquote_splicing(
-            e[:relations]
-            |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-            |> Enum.map(fn rel ->
-              quote do
-                def unquote(String.to_atom("list_by_#{rel[:name]}"))(
-                      _,
-                      %{unquote(rel[:name]) => arg},
-                      _
-                    ) do
-                  {:ok, unquote(api_module).unquote(String.to_atom("list_by_#{rel[:name]}"))(arg)}
-                end
+  defp resolver_module(e, schema, _) do
+    api_module = e[:api_module]
+
+    quote do
+      defmodule unquote(e[:resolver_module]) do
+        def list_all(_, _, _) do
+          {:ok, unquote(api_module).list()}
+        end
+
+        def get_by_id(_, %{id: id}, _) do
+          unquote(api_module).get_by_id(id)
+        end
+
+        unquote_splicing(
+          e[:attributes]
+          |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+          |> Enum.map(fn attr ->
+            quote do
+              def unquote(String.to_atom("get_by_#{attr[:name]}"))(
+                    _,
+                    %{unquote(attr[:name]) => arg},
+                    _
+                  ) do
+                unquote(api_module).unquote(String.to_atom("get_by_#{attr[:name]}"))(arg)
               end
-            end)
-          )
+            end
+          end)
+        )
 
-          def create(_, args, _) do
+        unquote_splicing(
+          e[:relations]
+          |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+          |> Enum.map(fn rel ->
+            quote do
+              def unquote(String.to_atom("list_by_#{rel[:name]}"))(
+                    _,
+                    %{unquote(rel[:name]) => arg},
+                    _
+                  ) do
+                {:ok, unquote(api_module).unquote(String.to_atom("list_by_#{rel[:name]}"))(arg)}
+              end
+            end
+          end)
+        )
+
+        def create(_, args, _) do
+          unquote(
+            case Enum.filter(e[:relations], fn rel -> rel[:kind] == :belongs_to end) do
+              [] ->
+                quote do
+                  unquote(api_module).create(args)
+                end
+
+              rels ->
+                quote do
+                  with unquote_splicing(
+                         rels
+                         |> Enum.map(fn rel ->
+                           parent_var = Macro.var(rel[:name], nil)
+                           target = find_entity!(schema, rel[:target])
+
+                           quote do
+                             {:ok, unquote(parent_var)} <-
+                               unquote(target[:api_module]).get_by_id(args.unquote(rel[:name]))
+                           end
+                         end)
+                       ) do
+                    args = Map.drop(args, unquote(Enum.map(rels, fn rel -> rel[:name] end)))
+
+                    unquote(api_module).create(
+                      unquote_splicing(
+                        Enum.map(rels, fn rel ->
+                          Macro.var(rel[:name], nil)
+                        end)
+                      ),
+                      args
+                    )
+                  end
+                end
+            end
+          )
+        end
+
+        def update(_, %{id: id} = args, _) do
+          with {:ok, entity} <- unquote(api_module).get(id) do
+            args = Map.drop(args, [:id])
+
             unquote(
               case Enum.filter(e[:relations], fn rel -> rel[:kind] == :belongs_to end) do
                 [] ->
                   quote do
-                    unquote(api_module).create(args)
+                    unquote(api_module).update(entity, args)
                   end
 
                 rels ->
@@ -426,12 +450,13 @@ defmodule Graphism do
                          ) do
                       args = Map.drop(args, unquote(Enum.map(rels, fn rel -> rel[:name] end)))
 
-                      unquote(api_module).create(
+                      unquote(api_module).update(
                         unquote_splicing(
                           Enum.map(rels, fn rel ->
                             Macro.var(rel[:name], nil)
                           end)
                         ),
+                        entity,
                         args
                       )
                     end
@@ -439,190 +464,137 @@ defmodule Graphism do
               end
             )
           end
+        end
 
-          def update(_, %{id: id} = args, _) do
-            with {:ok, entity} <- unquote(api_module).get(id) do
-              args = Map.drop(args, [:id])
-
-              unquote(
-                case Enum.filter(e[:relations], fn rel -> rel[:kind] == :belongs_to end) do
-                  [] ->
-                    quote do
-                      unquote(api_module).update(entity, args)
-                    end
-
-                  rels ->
-                    quote do
-                      with unquote_splicing(
-                             rels
-                             |> Enum.map(fn rel ->
-                               parent_var = Macro.var(rel[:name], nil)
-                               target = find_entity!(schema, rel[:target])
-
-                               quote do
-                                 {:ok, unquote(parent_var)} <-
-                                   unquote(target[:api_module]).get_by_id(
-                                     args.unquote(rel[:name])
-                                   )
-                               end
-                             end)
-                           ) do
-                        args = Map.drop(args, unquote(Enum.map(rels, fn rel -> rel[:name] end)))
-
-                        unquote(api_module).update(
-                          unquote_splicing(
-                            Enum.map(rels, fn rel ->
-                              Macro.var(rel[:name], nil)
-                            end)
-                          ),
-                          entity,
-                          args
-                        )
-                      end
-                    end
-                end
-              )
-            end
-          end
-
-          def delete(_, %{id: id}, _) do
-            with {:ok, entity} <- unquote(api_module).get_by_id(id) do
-              unquote(api_module).delete(entity)
-            end
+        def delete(_, %{id: id}, _) do
+          with {:ok, entity} <- unquote(api_module).get_by_id(id) do
+            unquote(api_module).delete(entity)
           end
         end
       end
-
-    mod = ast |> Macro.to_string() |> Code.format_string!()
-    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}.ex", mod)
-    ast
+    end
   end
 
   defp api_module(e, _, opts) do
     schema_module = e[:schema_module]
     repo_module = opts[:repo]
 
-    ast =
-      quote do
-        defmodule unquote(e[:api_module]) do
-          def list do
-            unquote(schema_module)
-            |> unquote(repo_module).all()
+    quote do
+      defmodule unquote(e[:api_module]) do
+        def list do
+          unquote(schema_module)
+          |> unquote(repo_module).all()
+        end
+
+        def get_by_id(id) do
+          case unquote(schema_module)
+               |> unquote(repo_module).get(id) do
+            nil ->
+              {:error, :not_found}
+
+            e ->
+              {:ok, e}
           end
+        end
 
-          def get_by_id(id) do
-            case unquote(schema_module)
-                 |> unquote(repo_module).get(id) do
-              nil ->
-                {:error, :not_found}
+        unquote_splicing(
+          e[:attributes]
+          |> Enum.filter(fn attr -> attr[:opts][:unique] end)
+          |> Enum.map(fn attr ->
+            quote do
+              def unquote(String.to_atom("get_by_#{attr[:name]}"))(value) do
+                value =
+                  case is_atom(value) do
+                    true ->
+                      "#{value}"
 
-              e ->
-                {:ok, e}
-            end
-          end
-
-          unquote_splicing(
-            e[:attributes]
-            |> Enum.filter(fn attr -> attr[:opts][:unique] end)
-            |> Enum.map(fn attr ->
-              quote do
-                def unquote(String.to_atom("get_by_#{attr[:name]}"))(value) do
-                  value =
-                    case is_atom(value) do
-                      true ->
-                        "#{value}"
-
-                      false ->
-                        value
-                    end
-
-                  case unquote(schema_module)
-                       |> unquote(repo_module).get_by([{unquote(attr[:name]), value}]) do
-                    nil ->
-                      {:error, :not_found}
-
-                    e ->
-                      {:ok, e}
+                    false ->
+                      value
                   end
+
+                case unquote(schema_module)
+                     |> unquote(repo_module).get_by([{unquote(attr[:name]), value}]) do
+                  nil ->
+                    {:error, :not_found}
+
+                  e ->
+                    {:ok, e}
                 end
+              end
+            end
+          end)
+        )
+
+        def create(
+              unquote_splicing(
+                e[:relations]
+                |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+                |> Enum.map(fn rel -> Macro.var(rel[:name], nil) end)
+              ),
+              attrs
+            ) do
+          unquote_splicing(
+            e[:relations]
+            |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+            |> Enum.map(fn rel ->
+              quote do
+                attrs =
+                  attrs
+                  |> Map.put(
+                    unquote(String.to_atom("#{rel[:name]}_id")),
+                    unquote(Macro.var(rel[:name], nil)).id
+                  )
               end
             end)
           )
 
-          def create(
-                unquote_splicing(
-                  e[:relations]
-                  |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-                  |> Enum.map(fn rel -> Macro.var(rel[:name], nil) end)
-                ),
-                attrs
-              ) do
-            unquote_splicing(
-              e[:relations]
-              |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-              |> Enum.map(fn rel ->
-                quote do
-                  attrs =
-                    attrs
-                    |> Map.put(
-                      unquote(String.to_atom("#{rel[:name]}_id")),
-                      unquote(Macro.var(rel[:name], nil)).id
-                    )
-                end
-              end)
-            )
-
-            with {:ok, e} <-
-                   %unquote(schema_module){}
-                   |> unquote(schema_module).changeset(attrs)
-                   |> unquote(repo_module).insert() do
-              get_by_id(e.id)
-            end
-          end
-
-          def update(
-                unquote_splicing(
-                  e[:relations]
-                  |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-                  |> Enum.map(fn rel ->
-                    Macro.var(rel[:name], nil)
-                  end)
-                ),
-                unquote(Macro.var(e[:name], nil)),
-                attrs
-              ) do
-            unquote_splicing(
-              e[:relations]
-              |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
-              |> Enum.map(fn rel ->
-                quote do
-                  attrs =
-                    attrs
-                    |> Map.put(
-                      unquote(String.to_atom("#{rel[:name]}_id")),
-                      unquote(Macro.var(rel[:name], nil)).id
-                    )
-                end
-              end)
-            )
-
-            with {:ok, unquote(Macro.var(e[:name], nil))} <-
-                   unquote(Macro.var(e[:name], nil))
-                   |> unquote(schema_module).changeset(attrs)
-                   |> unquote(repo_module).update() do
-              get_by_id(unquote(Macro.var(e[:name], nil)).id)
-            end
-          end
-
-          def delete(%unquote(schema_module){} = e) do
-            unquote(repo_module).delete(e)
+          with {:ok, e} <-
+                 %unquote(schema_module){}
+                 |> unquote(schema_module).changeset(attrs)
+                 |> unquote(repo_module).insert() do
+            get_by_id(e.id)
           end
         end
-      end
 
-    mod = ast |> Macro.to_string() |> Code.format_string!()
-    File.write!("/Users/pedrogutierrez/Desktop/#{e[:name]}_api.ex", mod)
-    ast
+        def update(
+              unquote_splicing(
+                e[:relations]
+                |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+                |> Enum.map(fn rel ->
+                  Macro.var(rel[:name], nil)
+                end)
+              ),
+              unquote(Macro.var(e[:name], nil)),
+              attrs
+            ) do
+          unquote_splicing(
+            e[:relations]
+            |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+            |> Enum.map(fn rel ->
+              quote do
+                attrs =
+                  attrs
+                  |> Map.put(
+                    unquote(String.to_atom("#{rel[:name]}_id")),
+                    unquote(Macro.var(rel[:name], nil)).id
+                  )
+              end
+            end)
+          )
+
+          with {:ok, unquote(Macro.var(e[:name], nil))} <-
+                 unquote(Macro.var(e[:name], nil))
+                 |> unquote(schema_module).changeset(attrs)
+                 |> unquote(repo_module).update() do
+            get_by_id(unquote(Macro.var(e[:name], nil)).id)
+          end
+        end
+
+        def delete(%unquote(schema_module){} = e) do
+          unquote(repo_module).delete(e)
+        end
+      end
+    end
   end
 
   defp find_entity!(schema, name) do
