@@ -36,6 +36,7 @@ defmodule Graphism.MixProject do
       {:absinthe, "~> 1.5"},
       {:absinthe_plug, "~> 1.5"},
       {:calendar, "~> 1.0.0"},
+      {:dataloader, "~> 1.0.0"},
       {:inflex, "~> 2.0.0"},
       {:phoenix, "~> 1.5.8"},
       {:phoenix_ecto, "~> 4.1"},

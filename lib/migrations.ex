@@ -240,7 +240,7 @@ defmodule Graphism.Migrations do
         (schema_columns -- existing_columns)
         |> Enum.map(fn col ->
           column = schema[name][:columns][col]
-          [column: col, type: column[:type], opts: column[:opts], action: :add]
+          [column: col, type: column[:type], opts: column[:opts], action: :add, kind: :column]
         end)
 
       # columns to remove
@@ -318,10 +318,10 @@ defmodule Graphism.Migrations do
       kind: :table,
       columns:
         Enum.map(columns_to_add, fn col ->
-          [column: col[:column], type: col[:type], opts: col[:opts], action: :add]
+          [column: col[:column], type: col[:type], opts: col[:opts], action: :add, kind: :column]
         end) ++
           Enum.map(columns_to_remove, fn col ->
-            [column: col, action: :remove]
+            [column: col, action: :remove, kind: :column]
           end)
     ]
   end

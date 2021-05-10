@@ -10,6 +10,8 @@ defmodule Graphism do
   require Logger
 
   defmacro __using__(opts \\ []) do
+    alias Dataloader, as: DL
+
     repo = opts[:repo]
 
     unless repo do
@@ -29,9 +31,41 @@ defmodule Graphism do
     Module.put_attribute(__CALLER__.module, :repo, opts[:repo])
 
     quote do
+      defmodule Dataloader.Repo do
+        def data() do
+          DL.Ecto.new(unquote(repo), query: &query/2)
+        end
+
+        def query(queryable, _params) do
+          queryable
+        end
+      end
+
       @before_compile unquote(__MODULE__)
       import unquote(__MODULE__), only: :macros
       use Absinthe.Schema
+      import Absinthe.Resolution.Helpers, only: [dataloader: 1]
+
+      @sources [unquote(__CALLER__.module).Dataloader.Repo]
+
+      def context(ctx) do
+        loader =
+          Enum.reduce(@sources, DL.new(), fn source, loader ->
+            DL.add_source(loader, source, source.data())
+          end)
+
+        Map.put(ctx, :loader, loader)
+      end
+
+      def plugins do
+        [Absinthe.Middleware.Dataloader] ++ Absinthe.Plugin.defaults()
+      end
+
+      def middleware(middleware, _field, %{identifier: :mutation}) do
+        middleware ++ [Graphism.ErrorMiddleware]
+      end
+
+      def middleware(middleware, _field, _object), do: middleware
     end
   end
 
@@ -52,8 +86,13 @@ defmodule Graphism do
         end
       end
 
+    schema =
+      schema
+      |> Enum.reverse()
+
     schema_modules =
-      Enum.map(schema, fn e ->
+      schema
+      |> Enum.map(fn e ->
         schema_module(e, schema, caller: __CALLER__)
       end)
 
@@ -74,7 +113,7 @@ defmodule Graphism do
 
     objects =
       Enum.map(schema, fn e ->
-        graphql_object(e, schema)
+        graphql_object(e, schema, caller: __CALLER__.module)
       end)
 
     queries =
@@ -286,7 +325,7 @@ defmodule Graphism do
     Keyword.put(e, :relations, relations)
   end
 
-  defp schema_module(e, _schema, _opts) do
+  defp schema_module(e, schema, _opts) do
     quote do
       defmodule unquote(e[:schema_module]) do
         use Ecto.Schema
@@ -305,20 +344,40 @@ defmodule Graphism do
             end)
           )
 
+          unquote_splicing(
+            e[:relations]
+            |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+            |> Enum.map(fn rel ->
+              target = find_entity!(schema, rel[:target])
+
+              quote do
+                Ecto.Schema.belongs_to(unquote(rel[:name]), unquote(target[:schema_module]),
+                  type: :binary_id
+                )
+              end
+            end)
+          )
+
           timestamps()
         end
 
         @required_fields unquote(
-                           e[:attributes]
-                           |> Enum.map(fn attr ->
-                             attr[:name]
-                           end)
+                           (e[:attributes]
+                            |> Enum.map(fn attr ->
+                              attr[:name]
+                            end)) ++
+                             (e[:relations]
+                              |> Enum.filter(fn rel -> rel[:kind] == :belongs_to end)
+                              |> Enum.map(fn rel ->
+                                String.to_atom("#{rel[:name]}_id")
+                              end))
                          )
 
         def changeset(e, attrs) do
           changes =
             e
             |> cast(attrs, @required_fields)
+            |> validate_required(@required_fields)
             |> unique_constraint(:id, name: unquote("#{e[:table]}_pkey"))
 
           unquote_splicing(
@@ -424,7 +483,7 @@ defmodule Graphism do
         end
 
         def update(_, %{id: id} = args, _) do
-          with {:ok, entity} <- unquote(api_module).get(id) do
+          with {:ok, entity} <- unquote(api_module).get_by_id(id) do
             args = Map.drop(args, [:id])
 
             unquote(
@@ -623,7 +682,7 @@ defmodule Graphism do
     end
   end
 
-  defp graphql_object(e, _schema) do
+  defp graphql_object(e, _schema, opts) do
     quote do
       object unquote(e[:name]) do
         (unquote_splicing(
@@ -653,7 +712,8 @@ defmodule Graphism do
                                non_null(unquote(rel[:target]))
                              end
                          end
-                       )
+                       ),
+                       resolve: dataloader(unquote(opts[:caller]).Dataloader.Repo)
                end
              end)
          ))
@@ -690,8 +750,8 @@ defmodule Graphism do
     quote do
       @desc "List all " <> unquote("#{e[:plural_display_name]}")
       field unquote(e[:plural]), list_of(unquote(e[:name])) do
+        middleware(MyApp.Web.Authentication)
         resolve(&unquote(e[:resolver_module]).list_all/3)
-        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -703,7 +763,6 @@ defmodule Graphism do
             unquote(e[:name]) do
         arg(:id, non_null(:id))
         resolve(&unquote(e[:resolver_module]).get_by_id/3)
-        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -725,8 +784,6 @@ defmodule Graphism do
           resolve(
             &(unquote(e[:resolver_module]).unquote(String.to_atom("get_by_#{attr[:name]}")) / 3)
           )
-
-          middleware(Graphism.ErrorMiddleware)
         end
       end
     end)
@@ -747,8 +804,6 @@ defmodule Graphism do
           resolve(
             &(unquote(e[:resolver_module]).unquote(String.to_atom("list_by_#{rel[:name]}")) / 3)
           )
-
-          middleware(Graphism.ErrorMiddleware)
         end
       end
     end)
@@ -786,7 +841,6 @@ defmodule Graphism do
         )
 
         resolve(&unquote(e[:resolver_module]).create/3)
-        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -813,7 +867,6 @@ defmodule Graphism do
         )
 
         resolve(&unquote(e[:resolver_module]).update/3)
-        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
@@ -826,7 +879,6 @@ defmodule Graphism do
       field unquote(mutation_name), unquote(e[:name]) do
         arg(:id, non_null(:id))
         resolve(&unquote(e[:resolver_module]).delete/3)
-        middleware(Graphism.ErrorMiddleware)
       end
     end
   end
